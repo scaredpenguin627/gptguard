@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+import sys
+import os
+import subprocess
+import json
+
+# Ensure src module can be imported even when run via symlink
+PROJECT_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+sys.path.insert(0, PROJECT_DIR)
+
+from src.config import ConfigManager
+from src import policy
+from pathlib import Path
+from src.brain import get_verdict, daemon_is_up, resolve_display_ip
+from src.integrity import cli_hook_status, repair, repair_cli, is_our_wrapper
+from src.network_guard import sync_hosts_file
+from src.update_guard import apply_auto_update_lock
+
+def mode_label(mode):
+    return {"both": "HTTP 和 STUN 都检查（both）", "http": "只检查 HTTP（http）", "stun": "只检查 STUN（stun）"}.get(mode, f"配置有误（{mode}）")
+
+def print_help():
+    help_text = """
+ClaudeGuard：按出口 IP 白名单保护 Claude
+
+用法：
+  claudeguard <命令> [参数]
+
+查看与检测：
+  status               查看防护状态、检测方式、当前出口和白名单
+  check                检查是否允许启动，退出码 0 表示允许，1 表示拦截
+  doctor               检查防护是否正常，并修复命令行启动入口
+
+出口与白名单：
+  set-access-mode <whitelist|risk>   选择白名单或风险评分规则
+  set-risk-threshold <0-100>         超过此风险分时拦截
+  set-check-interval <1-60秒>        设置出口轮询间隔，建议 3 秒
+  set-risk-cache-ttl <秒>            风险评分缓存有效期
+  detect-ip-change <on|off>          开关 IP 跳变检测
+  ack-ip-change                     确认当前出口并解除跳变拦截
+  set-ip-check-mode <both|http|stun>  选择检测方式
+                       both：HTTP 和 STUN 都须通过，http/stun：只检查对应协议
+  add-ip <ip>          将 IP 或 CIDR 网段加入白名单
+  remove-ip <ip>       从白名单移除 IP 或网段
+  list-ips             查看白名单
+  enable-protection    开启防护
+  disable-protection   关闭防护，解除 Claude 访问限制
+
+更新与模型：
+  block-updates        禁止 Claude 自动更新
+  allow-updates        允许 Claude 自动更新
+  set-model <model>    设置启动时固定使用的模型
+  enable-model         启用固定模型
+  disable-model        取消固定模型，使用 Claude 自身的设置
+
+启动与管理：
+  launch-desktop       检查出口后启动 Claude 桌面端
+  start                启动 ClaudeGuard 菜单栏守护
+  stop                 停止菜单栏守护，已有网络限制不会自动解除
+  install-cli-wrapper  为 claude 命令安装启动检查
+  set-cli-path <path>  指定原始 Claude Code 程序的路径
+"""
+    print(help_text.strip())
+
+def main():
+    if len(sys.argv) < 2:
+        print_help()
+        sys.exit(0)
+
+    cmd = sys.argv[1].lower()
+    config = ConfigManager()
+
+    if cmd == "status":
+        print("=== ClaudeGuard 状态 ===")
+        print(f"防护状态：{'已开启' if config.protection_enabled else '已关闭'}")
+        print(f"自动更新：{'已禁止' if config.block_auto_updates else '允许'}")
+        print(f"检测方式：{mode_label(config.ip_check_mode)}")
+        print(f"出口轮询间隔：{config.check_interval:g} 秒")
+        print("命令行 HTTP 代理：" + ("已开启" if config.config.get("cli_http_proxy_enabled", False) else "未开启"))
+        if config.model_override_enabled:
+            print(f"固定模型：{config.default_model}")
+        else:
+            print(f"固定模型：未启用")
+        print(f"IP 白名单： {', '.join(config.allowed_ips) if config.allowed_ips else '尚未设置，将阻止启动'}")
+
+        # Same verdict the wrapper and launcher enforce; show its source.
+        if policy.advanced(config.config):
+            print("访问规则：" + ("风险评分" if config.config.get('access_mode') == 'risk' else "IP 白名单"))
+            print(f"风险分阈值：{config.config.get('risk_threshold', 50)}，评分缓存：{config.config.get('risk_cache_ttl', 21600)} 秒")
+            print("IP 跳变检测：" + ("已开启" if config.config.get('detect_ip_change') else "已关闭"))
+        up = daemon_is_up()
+        print(f"判定来源： {'本次策略检查（复用有效评分缓存）' if policy.advanced(config.config) else ('🧠 后台守护' if up else '🔌 本次检测（后台守护未运行）')}")
+        print("\n正在检测出口 IP…" if not up else "")
+        if policy.advanced(config.config):
+            details = policy.check(config.config, Path(config.path).parent)
+            verdict, ip, err = details['state'], details.get('ip'), details.get('error')
+            for address, score in details.get('scores', {}).items():
+                print(f"风险分：{address}  {score['score']:g}/100（{'缓存' if score['cached'] else '刚查询'}）")
+        else:
+            verdict, ip, err = get_verdict(config, timeout=2.0)
+        # get_verdict returns ip=None when protection is off; show the real IP.
+        if ip is None:
+            ip = resolve_display_ip(config, timeout=2.0)
+        print(f"当前出口： {ip or '未获取'}")
+        if not config.protection_enabled:
+            print("访问状态：🟡 防护已关闭")
+        elif verdict == "allowed":
+            print("访问状态：🟢 已通过访问检查，允许访问")
+        elif verdict == "offline":
+            print("访问状态：⚪ 暂时无法确认出口 IP")
+        else:
+            print("访问状态：🔴 出口未通过访问检查，已拦截")
+        if err:
+            print(f"原因： {err}")
+
+    elif cmd in ("set-access-mode", "set-risk-threshold", "set-risk-cache-ttl", "detect-ip-change", "set-check-interval"):
+        if len(sys.argv) != 3:
+            print("请提供设置值，运行 claudeguard 查看用法。")
+            sys.exit(1)
+        key = {"set-access-mode": "access_mode", "set-risk-threshold": "risk_threshold",
+               "set-check-interval": "check_interval", "set-risk-cache-ttl": "risk_cache_ttl", "detect-ip-change": "detect_ip_change"}[cmd]
+        try:
+            value = sys.argv[2]
+            if key in ("risk_threshold", "risk_cache_ttl", "check_interval"):
+                value = float(value)
+            if key == "detect_ip_change":
+                if value not in ("on", "off"):
+                    raise ValueError("请填写 on 或 off")
+                value = value == "on"
+            updated = {**config.config, key: value}
+            policy.settings(updated)
+            config.save_config(updated)
+            print("设置已保存。")
+        except ValueError as exc:
+            print(f"设置失败：{exc}")
+            sys.exit(1)
+
+    elif cmd == "ack-ip-change":
+        data = policy.settings(config.config)
+        observed = policy.detect(data)
+        print(json.dumps(observed, ensure_ascii=False))
+        if input("确认信任这些出口？输入 yes 继续：").strip() != "yes":
+            sys.exit(1)
+        result = policy.check(data, Path(config.path).parent, acknowledge=True, expected_ips=observed)
+        if result.get('jump_acknowledged'):
+            print('已解除跳变拦截，继续检查访问规则。')
+        print(result['reason'])
+        sys.exit(0 if result['state'] == 'allowed' else 1)
+
+    elif cmd == "set-ip-check-mode":
+        if len(sys.argv) != 3 or sys.argv[2] not in ("both", "http", "stun"):
+            print("用法：claudeguard set-ip-check-mode <both|http|stun>")
+            sys.exit(1)
+        config.ip_check_mode = sys.argv[2]
+        print(f"检测方式已设为{mode_label(config.ip_check_mode)}，后台守护将在下一轮检测时采用新设置。")
+
+    elif cmd == "check":
+        if not config.protection_enabled:
+            sys.exit(0)
+        verdict, ip, err = get_verdict(config, timeout=2.0)
+        sys.exit(0 if verdict == "allowed" else 1)
+
+    elif cmd in ("add-ip", "add"):
+        if len(sys.argv) < 3:
+            print("请输入要加入白名单的 IP，例如： claudeguard add-ip 1.2.3.4")
+            sys.exit(1)
+        ip = sys.argv[2]
+        config.add_ip(ip)
+        print(f"✅ 已将 {ip} 加入白名单。")
+
+    elif cmd in ("remove-ip", "rm-ip", "remove"):
+        if len(sys.argv) < 3:
+            print("请输入要移除的 IP，例如： claudeguard remove-ip 1.2.3.4")
+            sys.exit(1)
+        ip = sys.argv[2]
+        config.remove_ip(ip)
+        print(f"✅ 已将 {ip} 从白名单移除。")
+
+    elif cmd in ("list-ips", "ips"):
+        print("IP 白名单：")
+        for ip in config.allowed_ips:
+            print(f" - {ip}")
+
+    elif cmd == "enable-protection":
+        config.protection_enabled = True
+        print("✅ 防护已开启。")
+
+    elif cmd == "disable-protection":
+        config.protection_enabled = False
+        sync_hosts_file(block_claude_domains=False, block_update_domains=config.block_auto_updates, config=config)
+        print("🟡 防护已关闭。")
+
+    elif cmd == "block-updates":
+        config.block_auto_updates = True
+        apply_auto_update_lock(True)
+        print("✅ 已禁止 Claude 自动更新。")
+
+    elif cmd == "allow-updates":
+        config.block_auto_updates = False
+        apply_auto_update_lock(False)
+        print("🟢 已允许 Claude 自动更新。")
+
+    elif cmd == "set-model":
+        if len(sys.argv) < 3:
+            print("请输入模型名称，例如： claudeguard set-model claude-opus-4-8")
+            sys.exit(1)
+        model = sys.argv[2].strip()
+        config.default_model = model
+        if not config.model_override_enabled:
+            config.model_override_enabled = True
+        print(f"✅ 启动时将固定使用 {model}。")
+
+    elif cmd == "enable-model":
+        config.model_override_enabled = True
+        print(f"✅ 已启用固定模型：{config.default_model}。")
+
+    elif cmd == "disable-model":
+        config.model_override_enabled = False
+        print("🟡 已取消固定模型，之后使用 Claude 自身的设置。")
+
+    elif cmd == "launch-desktop":
+        launcher = os.path.join(PROJECT_DIR, "src", "app_launcher.py")
+        os.execv(sys.executable, [sys.executable, launcher])
+
+    elif cmd in ("start", "launch", "open"):
+        plist = os.path.expanduser("~/Library/LaunchAgents/com.claudeguard.daemon.plist")
+        app_path = os.path.expanduser("~/.local/share/ClaudeGuard/bin/ClaudeGuardMenuBar")
+        subprocess.run(["launchctl", "load", plist], capture_output=True)
+        if not os.system("pgrep -f ClaudeGuardMenuBar >/dev/null") == 0:
+            subprocess.Popen([app_path])
+        print("🚀 ClaudeGuard 菜单栏守护已启动。")
+
+    elif cmd in ("stop", "quit", "close"):
+        plist = os.path.expanduser("~/Library/LaunchAgents/com.claudeguard.daemon.plist")
+        subprocess.run(["launchctl", "unload", plist], capture_output=True)
+        subprocess.run(["pkill", "-f", "ClaudeGuardMenuBar"], check=False)
+        print("🛑 菜单栏守护已停止，已有网络限制不会自动解除。")
+
+    elif cmd in ("doctor", "repair"):
+        doctor(config)
+
+    elif cmd == "install-cli-wrapper":
+        report = repair_cli(config)
+        for change in report["changed"]:
+            print(f"✅ {change}")
+        for note in report["notes"]:
+            print(f"⚠️  {note}")
+        if not report["changed"] and not report["notes"]:
+            print("✅ claude 命令的启动检查已就绪。")
+
+    elif cmd == "set-cli-path":
+        if len(sys.argv) < 3:
+            print("请输入原始 Claude Code 程序的路径，例如： claudeguard set-cli-path /opt/homebrew/bin/claude")
+            sys.exit(1)
+        path = os.path.realpath(sys.argv[2])
+        if not os.path.isfile(path):
+            print(f"路径不存在或不是文件：{path}")
+            sys.exit(1)
+        if is_our_wrapper(path):
+            print("这是 ClaudeGuard 的启动检查脚本，不是原始 Claude 程序。请运行 claudeguard doctor 自动查找。")
+            sys.exit(1)
+        if not os.access(path, os.X_OK):
+            print(f"文件没有执行权限：{path}")
+            sys.exit(1)
+        config.config["real_claude_cli_path"] = path
+        config.save_config()
+        print(f"✅ 原始 Claude Code 路径已设为：{path}")
+
+    else:
+        print(f"无法识别命令：{cmd}")
+        print_help()
+        sys.exit(1)
+
+def doctor(config):
+    """Report on every hook ClaudeGuard owns, then re-attach whatever came loose.
+    The command to run after Claude Code or Claude 桌面端 was reinstalled."""
+    print("=== ClaudeGuard 检查结果 ===\n")
+
+    report = repair(config)
+
+    intercepted, hooks = cli_hook_status()
+    print("Claude Code CLI")
+    if hooks:
+        for hook in hooks:
+            mark = "🟢" if hook["guarded"] else "🔴"
+            where = "" if hook["on_path"] else "  （不在 PATH 中）"
+            what = "已接入 ClaudeGuard 启动检查" if hook["guarded"] else "直接启动原程序，未接入检查"
+            print(f"  {mark} {hook['path']} → {what}{where}")
+    else:
+        print("  ⚪ 未在常见安装位置找到 claude 命令")
+    print(f"  原始程序： {report['real_cli'] or '未找到'}")
+    print(f"  启动检查： {'🟢 已接入' if intercepted else '🔴 未接入'}")
+
+    print("\nClaude 桌面端")
+    if report["desktop_app"]:
+        print(f"  🟢 {report['desktop_app']}（由菜单栏守护保护）")
+    else:
+        print("  ⚪ 未安装")
+
+    print("\n后台守护")
+    print(f"  {'🟢 正在运行' if daemon_is_up() else '🔴 未运行，请执行 claudeguard start'}")
+
+    print("\n网络拦截组件")
+    print(f"  {'🟢 系统网络助手已安装' if os.path.exists('/Library/LaunchDaemons/com.claudeguard.helper.plist') else '🔴 缺少系统网络助手，请重新运行 install.sh'}")
+
+    if report["changed"]:
+        print("\n已修复：")
+        for change in report["changed"]:
+            print(f"  ✅ {change}")
+    if report["notes"]:
+        print("\n需要注意：")
+        for note in report["notes"]:
+            print(f"  ⚠️  {note}")
+    if not report["changed"]:
+        print("\n✅ 未发现需要修复的启动入口。")
+
+if __name__ == "__main__":
+    main()
