@@ -40,7 +40,21 @@ state 是服务端签发的不透明密文。本项目只解析长度、时间�
 
 ## 下载
 
-Windows x64 预编译包放在 [Releases](https://github.com/scaredpenguin627/gptguard/releases/latest)。源码构建见下。
+Windows x64 预编译包放在 [Releases](https://github.com/scaredpenguin627/gptguard/releases/latest)。仓库的 `windows/` 目录也放了一份可直接双击的程序。
+
+## 小白怎么用
+
+1. 打开仓库的 `windows/` 目录，双击 `启动 GPTGuard（管理员）.cmd`。会弹 UAC。
+2. 托盘出现盾牌，浏览器自动打开面板。第一次运行会生成管理口令。
+3. 在面板的“出口白名单”里填代理出口 IP 或 CIDR，保存。
+4. 点“接管 Codex 配置”，重启 Codex，新建会话。
+5. 以后双击同一个 cmd 即可。
+
+需要开机自启时，双击 `安装开机自启.cmd`。卸载时先双击 `关闭开机自启.cmd`，再运行 `gptguard-cli.exe codex restore`。
+
+## 代码统计
+
+GitHub 之前把 `legacy/` 里的两个上游完整历史算进了语言统计，所以 Rust 只显示约 20%。根目录的 `.gitattributes` 已把 `legacy/**` 标记为 `linguist-vendored`。统计刷新后只计算新实现：约 6300 行 Rust，另有面板 HTML/CSS/JS。
 
 ## 快速开始
 
@@ -135,6 +149,7 @@ gptguard web
 |---|---|
 | `gptguard setup` | 创建配置，显示下一步 |
 | `gptguard run` | 启动守护：出口检测、Codex 转发、管理面板 |
+| `gptguard stop` | 停止守护进程，托盘可以继续保留 |
 | `gptguard tray` | 启动 Windows 托盘，并确保守护在运行 |
 | `gptguard status` | 读取守护状态 |
 | `gptguard check` | 立即检测出口；未通过时退出码为 1 |

@@ -323,6 +323,14 @@ mod imp {
     }
 
     pub fn run(start_guard: bool) -> Result<()> {
+        run_impl(start_guard, false)
+    }
+
+    pub fn run_gui() -> Result<()> {
+        run_impl(true, true)
+    }
+
+    fn run_impl(start_guard: bool, open_panel: bool) -> Result<()> {
         let paths = AppPaths::discover();
         paths.ensure()?;
         util::init_logging(&paths.log_dir)?;
@@ -337,6 +345,13 @@ mod imp {
         let _lock = lock;
         let config = Config::load_or_create(&paths)?;
         ensure_daemon(&paths, start_guard)?;
+        if open_panel {
+            let url = format!(
+                "http://127.0.0.1:{}/#token={}",
+                config.ui.web_port, config.ui.admin_token
+            );
+            let _ = util::open_url(&url);
+        }
 
         let event_loop = EventLoop::<()>::with_user_event()
             .build()
@@ -354,7 +369,7 @@ mod imp {
             return Ok(());
         }
         util::info("starting daemon from tray");
-        util::spawn_detached(&util::exe_path(), &["run"])?;
+        util::spawn_detached(&cli_path(), &["run"])?;
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(150));
             if daemon_alive(paths) {
@@ -364,15 +379,31 @@ mod imp {
         anyhow::bail!("守护启动超时；请从命令行运行 gptguard run 查看错误")
     }
 
+    fn cli_path() -> std::path::PathBuf {
+        let exe = util::exe_path();
+        for name in ["gptguard-cli.exe", "gptguard.exe"] {
+            let candidate = exe.with_file_name(name);
+            if candidate.is_file() && candidate != exe {
+                return candidate;
+            }
+        }
+        exe
+    }
+
     fn daemon_alive(paths: &AppPaths) -> bool {
         service::daemon_running(paths)
     }
 }
 
 #[cfg(windows)]
-pub use imp::run;
+pub use imp::{run, run_gui};
 
 #[cfg(not(windows))]
 pub fn run(_start_guard: bool) -> anyhow::Result<()> {
     anyhow::bail!("托盘目前只支持 Windows；其他平台请使用 gptguard run 和网页面板")
+}
+
+#[cfg(not(windows))]
+pub fn run_gui() -> anyhow::Result<()> {
+    run(true)
 }

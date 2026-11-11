@@ -1,0 +1,10 @@
+# Keep upstream histories in the repository without letting GitHub count them
+# as this project's implementation language.
+legacy/** linguist-vendored
+docs/** linguist-documentation
+dist/** linguist-vendored
+windows/*.exe binary
+windows/*.dll binary
+*.png binary
+*.jpg binary
+*.zip binary

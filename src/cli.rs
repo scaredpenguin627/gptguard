@@ -21,8 +21,10 @@ use crate::util;
     about = "GPTGuard / GPTGuard: 出口守卫与 Codex turn-state 转发"
 )]
 pub struct Cli {
+    /// Running `gptguard.exe` without arguments starts the tray, which is the
+    /// double-click path for non-CLI users.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -34,6 +36,8 @@ enum Command {
         #[arg(long)]
         open_panel: bool,
     },
+    /// 停止守护进程（不退出托盘）
+    Stop,
     /// 启动 Windows 托盘（会确保守护在运行）
     Tray {
         #[arg(long)]
@@ -136,12 +140,14 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = AppPaths::discover();
     paths.ensure()?;
-    match cli.command {
+    let command = cli.command.unwrap_or(Command::Tray { start_guard: true });
+    match command {
         Command::Setup => setup(paths),
         Command::Run { open_panel } => {
             let config = Config::load_or_create(&paths)?;
             block_on(service::run(config, paths, open_panel))
         }
+        Command::Stop => stop(&paths),
         Command::Tray { start_guard } => crate::tray::run(start_guard),
         Command::Status => status(&paths),
         Command::Check => block_on(check(&paths)),
@@ -190,6 +196,39 @@ fn setup(paths: AppPaths) -> Result<()> {
     for target in &config.protection.targets {
         println!("  - {}: {}", target.name, target.path);
     }
+    Ok(())
+}
+
+fn stop(paths: &AppPaths) -> Result<()> {
+    let Some(state) = service::read_state(paths) else {
+        println!("守护未运行");
+        return Ok(());
+    };
+    if !service::daemon_running(paths) {
+        println!("守护未运行");
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &state.pid.to_string(), "/T", "/F"])
+            .status()
+            .context("run taskkill")?;
+        if !status.success() {
+            bail!("停止守护失败（PID {}）；请用管理员终端重试", state.pid);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &state.pid.to_string()])
+            .status()
+            .context("run kill")?;
+        if !status.success() {
+            bail!("停止守护失败（PID {}）", state.pid);
+        }
+    }
+    println!("已停止守护（PID {}）", state.pid);
     Ok(())
 }
 

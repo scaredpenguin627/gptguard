@@ -1,0 +1,40 @@
+GPTGuard 使用说明
+================
+
+一、第一次使用
+1. 双击“启动 GPTGuard（管理员）.cmd”，在弹出的 UAC 窗口点“是”。
+2. 托盘出现盾牌图标，浏览器会自动打开 http://127.0.0.1:17842。
+3. 在“出口白名单”填代理出口 IP 或 CIDR，例如 203.0.113.10，点“保存白名单”。
+4. 点“接管 Codex 配置”，然后重启 Codex，新建一个会话。
+5. 以后每次使用，双击同一个 cmd 即可。
+
+二、如果只想先看看界面
+双击“启动 GPTGuard（普通）.cmd”。普通权限可以检测出口、管理 Codex
+配置和看日志，但 hosts、Windows 防火墙和自动更新锁需要管理员权限。
+面板会显示“执行层异常”，这时用管理员启动。
+
+三、开机自启
+双击“安装开机自启.cmd”。取消时双击“关闭开机自启.cmd”。
+
+四、打开面板
+双击“打开面板.cmd”。如果面板打不开，先启动 GPTGuard。
+
+五、退出
+右键托盘盾牌，选“退出托盘”。守护会继续运行。
+要停止守护，在命令行运行：
+    gptguard-cli.exe stop
+
+六、恢复 Codex 配置
+    gptguard-cli.exe codex restore
+如果接管后手动改过 Codex 配置，恢复会被拒绝。确认要覆盖时加 --force。
+
+七、文件位置
+配置：%APPDATA%\GPTGuard\config.json
+日志：%LOCALAPPDATA%\GPTGuard\logs
+备份：%LOCALAPPDATA%\GPTGuard\backups
+
+八、注意
+- 这是第三方工具，与 OpenAI 没有隶属关系。
+- 不保证提升模型质量，不保证取得 state，不绕过账号额度或限流。
+- 采集 state 会发送真实请求并消耗额度。
+- 发布包未签名，Windows 可能提示 SmartScreen。

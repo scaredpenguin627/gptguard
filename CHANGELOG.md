@@ -1,3 +1,10 @@
+# 0.2.1
+
+- 增加无控制台的 GUI/托盘入口 `gptguard-gui.exe`，并随仓库提供 `windows/GPTGuard.exe`。
+- 增加一键启动、管理员启动、开机自启和打开面板脚本。
+- `.gitattributes` 标记 `legacy/**` 为 vendored，修正 GitHub 语言统计。
+- 在管理员权限下实际验证 Windows 更新锁的 hosts 写入与恢复。
+
 # 0.2.0
 
 - 项目、二进制、配置路径、Windows 标记和 GitHub 仓库更名为 GPTGuard。
