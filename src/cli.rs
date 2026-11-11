@@ -92,6 +92,7 @@ enum Command {
         #[arg(value_enum)]
         action: OnOff,
     },
+
     /// 先检测出口，再启动命令；运行中出口失配会终止子进程
     Guard {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -163,6 +164,7 @@ pub fn run() -> Result<()> {
         Command::Codex { action } => block_on(codex(&paths, action)),
         Command::UpdateLock { action } => update_lock(&paths, action),
         Command::Autostart { action } => autostart(&paths, action),
+
         Command::Guard { command } => block_on(guarded(command, paths)),
     }
 }
@@ -389,6 +391,9 @@ fn set(paths: &AppPaths, key: &str, value: &str) -> Result<()> {
         }
         "network-guard" => {
             config.protection.network_guard = value.parse().context("network-guard")?;
+        }
+        "proxy-only" => {
+            config.protection.proxy_only = value.parse().context("proxy-only")?;
         }
         "kill-on-block" => {
             config.protection.kill_on_block = value.parse().context("kill-on-block")?;

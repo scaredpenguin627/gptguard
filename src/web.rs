@@ -149,6 +149,7 @@ fn config_view(cfg: &Config) -> serde_json::Value {
             "http_proxy": cfg.protection.http_proxy.as_deref().map(util::mask_url),
             "targets": cfg.protection.targets,
             "network_guard": cfg.protection.network_guard,
+            "proxy_only": cfg.protection.proxy_only,
             "kill_on_block": cfg.protection.kill_on_block,
         },
         "codex": {

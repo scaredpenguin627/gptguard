@@ -201,7 +201,9 @@ pub async fn run(config: Config, paths: AppPaths, open_panel: bool) -> Result<()
     // Do not leave a dead daemon's block behind. Update locking is separate and
     // remains until the user turns it off explicitly.
     let latest = state.config();
-    if latest.protection.network_guard {
+    if latest.protection.proxy_only {
+        util::warn("proxy_only 模式：守护停止后保留防火墙阻断；关闭防护后重启可解除");
+    } else if latest.protection.network_guard {
         let _ = guard::enforce(&latest, false);
     }
     let mut state_now = state.runtime();
@@ -273,8 +275,14 @@ async fn evaluate_once(state: &AppState, manual: bool) -> RuntimeState {
     }
     let started = std::time::Instant::now();
     let report = ipcheck::check(&cfg).await;
-    let block = !report.allowed;
+    let block = cfg.protection.proxy_only || !report.allowed;
     let enforcement = apply_enforcement(state, &cfg, block, manual);
+    if cfg.protection.proxy_only && !report.allowed && cfg.protection.kill_on_block {
+        // Keep the app from continuing with a direct connection while the
+        // firewall rule is being refreshed.
+        let killed = guard::target_paths(&cfg);
+        let _ = util::kill_processes(&killed);
+    }
     let mut status = if report.allowed {
         Verdict::Allowed
     } else if report.detected {
@@ -282,7 +290,7 @@ async fn evaluate_once(state: &AppState, manual: bool) -> RuntimeState {
     } else {
         Verdict::Offline
     };
-    if status != Verdict::Allowed && !enforcement.errors.is_empty() {
+    if !enforcement.errors.is_empty() && (status != Verdict::Allowed || cfg.protection.proxy_only) {
         status = Verdict::Error;
     }
     let mut detail = report.detail.clone();

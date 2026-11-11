@@ -27,6 +27,7 @@ state 是服务端签发的不透明密文。本项目只解析长度、时间�
 |---|---|
 | 出口检测 | HTTP 与 STUN 双通道；支持 `both`、`http`、`stun`；IPv4/IPv6 CIDR 白名单；检测失败按失败处理 |
 | Windows 执行层 | hosts 阻断、按 exe 的 Windows 防火墙出站规则、终止目标进程；需要管理员权限 |
+| 系统级阻断 | `proxy_only` 模式始终阻断受保护 exe 的非回环连接，只允许访问 127.0.0.1 本地代理 |
 | 失败关闭 | 白名单为空、检测超时、state 采集失败都不会当成“已放行” |
 | Codex 接管 | 备份原 `config.toml`，写入本地 provider，退出时恢复；接管后文件被改动会停止转发并返回 409 |
 | turn-state | 解析 10/12/33 块；个人规则接受 `{10,33}`，Team 接受 `{12,33}`；active/ready 双槽与有效期 |
@@ -51,6 +52,24 @@ Windows x64 预编译包放在 [Releases](https://github.com/scaredpenguin627/gp
 5. 以后双击同一个 cmd 即可。
 
 需要开机自启时，双击 `安装开机自启.cmd`。卸载时先双击 `关闭开机自启.cmd`，再运行 `gptguard-cli.exe codex restore`。
+
+## 系统级阻断
+
+默认模式只在出口 IP 不合格时阻断。`proxy-only` 模式更严格：受保护程序始终不能直连外部，只能访问本机回环代理。
+
+```powershell
+gptguard add-ip <出口 IP 或 CIDR>
+gptguard set proxy-only true
+gptguard run
+```
+
+Windows 防火墙规则按 exe 路径生效，回环流量默认放行。实测结果：
+
+- `curl` 访问外部地址失败。
+- `curl` 访问 `127.0.0.1` 本地服务成功。
+- 停守护后规则保留，程序继续被阻断。关闭防护或删除规则后恢复。
+
+`proxy-only` 需要管理员权限。它不能覆盖子进程、复制后的 exe 或用户自己新建的同类程序。
 
 ## 代码统计
 
@@ -182,6 +201,7 @@ gptguard web
 | `account-mode` | `auto`、`personal`、`team` |
 | `fixed-model` | `true`、`false` |
 | `network-guard` | `true`、`false` |
+| `proxy-only` | `true`、`false`；始终阻断受保护程序的非回环连接 |
 | `kill-on-block` | `true`、`false` |
 | `injection` | `true`、`false` |
 | `http-proxy` | 出口检测使用的 HTTP 代理；空字符串表示不用 |
@@ -243,7 +263,7 @@ gptguard state add-block 33
 
 这些地方与上游项目不同，或者还没做完：
 
-- Windows 网络层用 `netsh advfirewall` 按 exe 阻断，没有移植 ClaudeGuard 的 WFP 内核助手。规则按程序路径生效，升级换路径后需要重新确认。
+- Windows 网络层用 Windows 防火墙按 exe 阻断。Windows 防火墙本身是 WFP 的策略层，规则允许回环、阻断外部连接。独立 WFP 服务没有发布：直接写 WFP 过滤器时，回环放行需要额外验证，未验证的过滤器会切断本机网络。规则按程序路径生效，升级换路径后需要重新确认。
 - 没有内嵌 Mihomo。代理只支持 HTTP、HTTPS、SOCKS5。Shadowsocks、VMess、VLESS、Trojan、Hysteria 等节点不会导入。
 - PR #6 的“本地 Clash + 多个落地出口”两跳链式采集没有完整移植。当前支持多个单跳出口和订阅，出口模式仍是单跳。
 - macOS 和 Linux 可以跑出口检测、Codex 转发和面板；hosts、防火墙、更新锁和托盘没有对应实现。

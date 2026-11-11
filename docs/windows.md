@@ -48,6 +48,25 @@ hosts 段用固定标记包起来：
 
 普通权限下，hosts 和防火墙会失败，状态变成 `error`，详情里带原因。进程终止不需要管理员权限，但只能终止当前用户有权限终止的进程。
 
+## 只允许本地代理
+
+`proxy_only = true` 时，守护始终给受保护的 exe 添加 Windows 防火墙出站阻断规则，不依赖当前出口检测结果。Windows 防火墙默认放行回环流量，所以程序仍能连接 `127.0.0.1:17841` 的 GPTGuard 网关，但无法直连外部。
+
+```powershell
+gptguard set proxy-only true
+gptguard set network-guard true
+gptguard run
+```
+
+需要管理员权限。实测：
+
+- 外部 HTTPS 连接失败。
+- `127.0.0.1` 本地 HTTP 服务返回 200。
+- 停止守护后规则保留，程序继续被阻断。
+- 关闭防护后重启守护，规则删除。
+
+这个模式按 exe 路径匹配。复制 exe、改名、子进程不受同一条规则约束。需要覆盖子进程时，用独立 Windows 用户运行受保护程序，再按用户 SID 做防火墙或 WFP 策略。
+
 ## 自动更新锁定
 
 `gptguard update-lock on` 做两件事：

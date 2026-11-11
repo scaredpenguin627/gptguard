@@ -74,6 +74,10 @@ pub struct ProtectionConfig {
     pub targets: Vec<TargetConfig>,
     #[serde(default = "default_true")]
     pub network_guard: bool,
+    /// Always block non-loopback traffic for the configured executables, even
+    /// when the exit IP is allowed. The apps can only use the local relay.
+    #[serde(default)]
+    pub proxy_only: bool,
     #[serde(default = "default_true")]
     pub kill_on_block: bool,
     #[serde(default = "default_blocked_domains")]
@@ -108,6 +112,7 @@ impl Default for ProtectionConfig {
             http_proxy: None,
             targets: detect_targets(),
             network_guard: true,
+            proxy_only: false,
             kill_on_block: true,
             domains: default_blocked_domains(),
         }

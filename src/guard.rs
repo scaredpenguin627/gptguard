@@ -227,6 +227,20 @@ pub fn enforce(config: &Config, block: bool) -> EnforcementReport {
         elevated: util::is_elevated(),
         ..Default::default()
     };
+    if config.protection.proxy_only {
+        if block {
+            match apply_firewall(&config.protection.targets) {
+                Ok(()) => report.firewall_blocked = true,
+                Err(err) => report.errors.push(format!("firewall: {err:#}")),
+            }
+        } else {
+            match remove_firewall(&config.protection.targets) {
+                Ok(()) => {}
+                Err(err) => report.errors.push(format!("firewall: {err:#}")),
+            }
+        }
+        return report;
+    }
     if config.protection.network_guard {
         if block {
             match apply_hosts_block(&config.protection.domains, GUARD_BEGIN, GUARD_END) {
