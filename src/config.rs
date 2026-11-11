@@ -12,11 +12,22 @@ use ipnet::IpNet;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-pub const APP_NAME: &str = "AIGuard";
-pub const DISPLAY_NAME: &str = "ChatGPTGuard";
+pub const APP_NAME: &str = "GPTGuard";
+pub const DISPLAY_NAME: &str = "GPTGuard";
 pub const DEFAULT_PORT: u16 = 17841;
 pub const DEFAULT_MODEL: &str = "gpt-6-astra";
-pub const SUPPORTED_MODELS: [&str; 3] = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"];
+/// Advisory catalog only. Codex accepts model names from the upstream, and a
+/// release can add models faster than this binary. Validation never rejects an
+/// unknown model solely because it is absent here.
+pub const DEFAULT_MODELS: [&str; 7] = [
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+    "gpt-6.2-astra",
+    "gpt-6.2-sol",
+];
 const CONFIG_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,6 +160,20 @@ pub struct CodexConfig {
     pub model: String,
     #[serde(default)]
     pub fixed_model: bool,
+    /// Advisory model list shown in the panel and CLI. Unknown models are still
+    /// forwarded; this is not an access-control allowlist.
+    #[serde(default = "default_models")]
+    pub models: Vec<String>,
+    #[serde(default = "default_auxiliary_models")]
+    pub auxiliary_models: Vec<String>,
+    #[serde(default = "default_auxiliary_prefixes")]
+    pub auxiliary_prefixes: Vec<String>,
+    #[serde(default = "default_calibration_prefixes")]
+    pub calibration_prefixes: Vec<String>,
+    /// Extra block counts accepted for future state shapes. Account defaults
+    /// remain 10/33 for personal and 12/33 for Team.
+    #[serde(default)]
+    pub extra_state_blocks: Vec<usize>,
     #[serde(default)]
     pub account_mode: AccountMode,
     #[serde(default = "default_true")]
@@ -187,6 +212,25 @@ fn default_listen() -> String {
 fn default_model() -> String {
     DEFAULT_MODEL.to_string()
 }
+fn default_models() -> Vec<String> {
+    DEFAULT_MODELS
+        .iter()
+        .map(|model| (*model).to_string())
+        .collect()
+}
+fn default_auxiliary_models() -> Vec<String> {
+    vec![
+        "codex-auto-review".into(),
+        "codex-mini-latest".into(),
+        "gpt-5-codex-mini".into(),
+    ]
+}
+fn default_auxiliary_prefixes() -> Vec<String> {
+    vec!["codex-".into()]
+}
+fn default_calibration_prefixes() -> Vec<String> {
+    vec!["gpt-".into(), "o".into()]
+}
 fn default_ttl() -> u64 {
     3600
 }
@@ -213,6 +257,11 @@ impl Default for CodexConfig {
             listen: default_listen(),
             model: default_model(),
             fixed_model: false,
+            models: default_models(),
+            auxiliary_models: default_auxiliary_models(),
+            auxiliary_prefixes: default_auxiliary_prefixes(),
+            calibration_prefixes: default_calibration_prefixes(),
+            extra_state_blocks: Vec::new(),
             account_mode: AccountMode::Auto,
             injection: true,
             state_fallback: StateFallback::Passthrough,
@@ -357,7 +406,7 @@ impl AppPaths {
             state_file: data_dir.join("state.json"),
             log_dir: data_dir.join("logs"),
             backups_dir: data_dir.join("backups"),
-            lock_file: data_dir.join("aiguard.lock"),
+            lock_file: data_dir.join("gptguard.lock"),
             config_dir,
             data_dir,
         }
@@ -444,8 +493,30 @@ impl Config {
         if self.ui.web_port == addr.port() {
             bail!("ui.web_port must differ from codex.listen");
         }
-        if !SUPPORTED_MODELS.contains(&self.codex.model.as_str()) {
-            bail!("codex.model must be one of {}", SUPPORTED_MODELS.join(", "));
+        if !valid_model_id(&self.codex.model) {
+            bail!("codex.model contains unsupported characters");
+        }
+        if self.codex.models.len() > 256 {
+            bail!("codex.models has too many entries");
+        }
+        for model in &self.codex.models {
+            if !valid_model_id(model) {
+                bail!("codex.models contains invalid model id {model:?}");
+            }
+        }
+        if self.codex.auxiliary_models.len() > 128
+            || self.codex.auxiliary_prefixes.len() > 64
+            || self.codex.calibration_prefixes.len() > 64
+        {
+            bail!("too many model classification entries");
+        }
+        if self.codex.extra_state_blocks.len() > 16 {
+            bail!("codex.extra_state_blocks has too many entries");
+        }
+        for blocks in &self.codex.extra_state_blocks {
+            if !(1..=128).contains(blocks) {
+                bail!("codex.extra_state_blocks entries must be 1-128");
+            }
         }
         if self.codex.ttl_seconds < 120 || self.codex.ttl_seconds > 3600 {
             bail!("codex.ttl_seconds must be 120-3600");
@@ -562,6 +633,17 @@ pub fn validate_upstream(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Model ids are opaque to this project. Only syntax is checked so a value
+/// cannot become a header/URL injection. New upstream models do not need a
+/// code change here.
+pub fn valid_model_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/' | b':'))
+}
+
 pub fn validate_domain(value: &str) -> Result<()> {
     let domain = value.trim();
     if domain.is_empty() || domain.len() > 253 {
@@ -676,6 +758,25 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.codex.listen, "127.0.0.1:17841");
+    }
+
+    #[test]
+    fn accepts_models_outside_the_builtin_catalog() {
+        let mut cfg = Config::default();
+        cfg.codex.model = "gpt-6.2-astra".into();
+        cfg.codex.models.push("gpt-7-future".into());
+        assert!(cfg.validate().is_ok());
+        assert!(cfg.codex.models.iter().any(|model| model == "gpt-6.1-sol"));
+        assert!(cfg.codex.models.iter().any(|model| model == "gpt-6.2-sol"));
+    }
+
+    #[test]
+    fn validates_extra_state_blocks() {
+        let mut cfg = Config::default();
+        cfg.codex.extra_state_blocks = vec![41, 57];
+        assert!(cfg.validate().is_ok());
+        cfg.codex.extra_state_blocks = vec![0];
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

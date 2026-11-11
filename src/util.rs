@@ -17,7 +17,7 @@ static ELEVATED: OnceLock<bool> = OnceLock::new();
 pub fn init_logging(log_dir: &Path) -> Result<()> {
     fs::create_dir_all(log_dir)?;
     let path = log_dir.join(format!(
-        "aiguard-{}.log",
+        "gptguard-{}.log",
         chrono::Local::now().format("%Y%m%d")
     ));
     let file = OpenOptions::new()
@@ -228,7 +228,7 @@ pub fn spawn_detached(program: &Path, args: &[&str]) -> Result<()> {
 }
 
 pub fn exe_path() -> PathBuf {
-    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aiguard.exe"))
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("gptguard.exe"))
 }
 
 #[cfg(test)]
@@ -237,10 +237,10 @@ mod tests {
 
     #[test]
     fn hash_is_hex_and_stable() {
-        let first = sha256_hex(b"aiguard");
+        let first = sha256_hex(b"gptguard");
         assert_eq!(first.len(), 64);
-        assert_eq!(first, sha256_hex(b"aiguard"));
-        assert_ne!(first, sha256_hex(b"aiguard2"));
+        assert_eq!(first, sha256_hex(b"gptguard"));
+        assert_ne!(first, sha256_hex(b"gptguard2"));
     }
 
     #[test]

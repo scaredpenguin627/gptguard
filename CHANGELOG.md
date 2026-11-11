@@ -1,3 +1,13 @@
+# 0.2.0
+
+- 项目、二进制、配置路径、Windows 标记和 GitHub 仓库更名为 GPTGuard。
+- 移除模型白名单硬编码。未知模型只检查语法，默认校准 `gpt-*` 和 `o*`。
+- 预置 `gpt-6.1-sol`、`gpt-6.1-terra`、`gpt-6.2-astra`、`gpt-6.2-sol`。
+- Codex 请求 `/models` 时自动学习新模型 id，写入 `codex.models`。
+- 新增 `gptguard models list/add/remove`、`gptguard state list/add-block/remove-block`。
+- 面板增加固定模型和额外 state 块数入口。
+- 配置文件迁移到 `%APPDATA%\GPTGuard`，数据迁移到 `%LOCALAPPDATA%\GPTGuard`。
+
 # 0.1.1
 
 - 修复守护被强制结束后，以“防护关闭”状态重启时不会清理残留 hosts/防火墙阻断的问题。

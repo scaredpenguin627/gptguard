@@ -16,9 +16,9 @@ use crate::util;
 
 #[derive(Parser)]
 #[command(
-    name = "aiguard",
+    name = "gptguard",
     version,
-    about = "ChatGPTGuard / AIGuard: 出口守卫与 Codex turn-state 转发"
+    about = "GPTGuard / GPTGuard: 出口守卫与 Codex turn-state 转发"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -63,6 +63,16 @@ enum Command {
     Model {
         model: String,
     },
+    /// 模型目录：查看、添加、移除；它只影响校准分类，不是访问白名单
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
+    },
+    /// state 形状：查看、添加、移除未来模型的块数
+    State {
+        #[command(subcommand)]
+        action: StateAction,
+    },
     /// Codex 配置接管
     Codex {
         #[command(subcommand)]
@@ -83,6 +93,21 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ModelsAction {
+    List,
+    Add { model: String },
+    Remove { model: String },
+    Reset,
+}
+
+#[derive(Subcommand)]
+enum StateAction {
+    List,
+    AddBlock { blocks: usize },
+    RemoveBlock { blocks: usize },
 }
 
 #[derive(Subcommand)]
@@ -127,6 +152,8 @@ pub fn run() -> Result<()> {
         Command::ListIps => list_ips(&paths),
         Command::Set { key, value } => set(&paths, &key, &value),
         Command::Model { model } => set_model(&paths, &model),
+        Command::Models { action } => models(&paths, action),
+        Command::State { action } => state(&paths, action),
         Command::Codex { action } => block_on(codex(&paths, action)),
         Command::UpdateLock { action } => update_lock(&paths, action),
         Command::Autostart { action } => autostart(&paths, action),
@@ -154,10 +181,10 @@ fn setup(paths: AppPaths) -> Result<()> {
     println!("管理口令: {}", config.ui.admin_token);
     println!();
     println!("下一步:");
-    println!("  1. aiguard add-ip <你的代理出口 IP 或 CIDR>");
-    println!("  2. aiguard set ip-check-mode both|http|stun");
-    println!("  3. aiguard codex takeover --auth chatgpt");
-    println!("  4. aiguard run        # 或 aiguard tray");
+    println!("  1. gptguard add-ip <你的代理出口 IP 或 CIDR>");
+    println!("  2. gptguard set ip-check-mode both|http|stun");
+    println!("  3. gptguard codex takeover --auth chatgpt");
+    println!("  4. gptguard run        # 或 gptguard tray");
     println!();
     println!("目标程序:");
     for target in &config.protection.targets {
@@ -180,7 +207,7 @@ fn status(paths: &AppPaths) -> Result<()> {
         }
         None => {
             println!("守护未运行（没有 state.json）");
-            println!("启动: aiguard run 或 aiguard tray");
+            println!("启动: gptguard run 或 gptguard tray");
             Ok(())
         }
     }
@@ -295,10 +322,13 @@ fn set(paths: &AppPaths, key: &str, value: &str) -> Result<()> {
             config.protection.interval_seconds = value.parse().context("interval")?;
         }
         "model" => {
-            if !crate::config::SUPPORTED_MODELS.contains(&value) {
-                bail!("model must be gpt-6-astra, gpt-5.6-sol or gpt-5.6-terra");
+            if !crate::config::valid_model_id(value) {
+                bail!("model contains unsupported characters");
             }
             config.codex.model = value.to_string();
+            if !config.codex.models.iter().any(|model| model == value) {
+                config.codex.models.push(value.to_string());
+            }
         }
         "fallback" => {
             config.codex.state_fallback = match value {
@@ -351,17 +381,113 @@ fn set(paths: &AppPaths, key: &str, value: &str) -> Result<()> {
 }
 
 fn set_model(paths: &AppPaths, model: &str) -> Result<()> {
-    if !crate::config::SUPPORTED_MODELS.contains(&model) {
-        bail!("model must be gpt-6-astra, gpt-5.6-sol or gpt-5.6-terra");
+    if !crate::config::valid_model_id(model) {
+        bail!("model contains unsupported characters");
     }
     let mut config = Config::load_or_create(paths)?;
     config.codex.model = model.to_string();
     config.codex.fixed_model = true;
+    if !config.codex.models.iter().any(|entry| entry == model) {
+        config.codex.models.push(model.to_string());
+    }
     config.save(paths)?;
     if config_tx::set_installed_model(&config, paths, model)? {
         println!("已固定模型并写入当前 Codex 接管配置: {model}");
     } else {
         println!("已固定模型: {model}；下次 codex takeover 时写入");
+    }
+    Ok(())
+}
+
+fn models(paths: &AppPaths, action: ModelsAction) -> Result<()> {
+    let mut config = Config::load_or_create(paths)?;
+    match action {
+        ModelsAction::List => {
+            for model in &config.codex.models {
+                let selected = if model == &config.codex.model {
+                    "*"
+                } else {
+                    " "
+                };
+                println!("{selected} {model}");
+            }
+            println!(
+                "\n校准前缀: {}",
+                config.codex.calibration_prefixes.join(", ")
+            );
+            println!("辅助模型: {}", config.codex.auxiliary_models.join(", "));
+            println!("辅助前缀: {}", config.codex.auxiliary_prefixes.join(", "));
+        }
+        ModelsAction::Add { model } => {
+            if !crate::config::valid_model_id(&model) {
+                bail!("model contains unsupported characters");
+            }
+            if !config.codex.models.iter().any(|entry| entry == &model) {
+                config.codex.models.push(model.clone());
+                config.save(paths)?;
+            }
+            println!("已加入模型目录: {model}");
+        }
+        ModelsAction::Remove { model } => {
+            if model == config.codex.model {
+                bail!("不能移除当前选中的模型；先切换到其他模型");
+            }
+            config.codex.models.retain(|entry| entry != &model);
+            config.save(paths)?;
+            println!("已移除模型目录项: {model}");
+        }
+        ModelsAction::Reset => {
+            config.codex.models = crate::config::DEFAULT_MODELS
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect();
+            config.save(paths)?;
+            println!("模型目录已重置为内置列表");
+        }
+    }
+    Ok(())
+}
+
+fn state(paths: &AppPaths, action: StateAction) -> Result<()> {
+    let mut config = Config::load_or_create(paths)?;
+    match action {
+        StateAction::List => {
+            let (personal, _) = crate::codex::provider::accepted_blocks_with_extra(
+                &crate::config::AccountMode::Personal,
+                10,
+                None,
+                &config.codex.extra_state_blocks,
+            );
+            let (team, _) = crate::codex::provider::accepted_blocks_with_extra(
+                &crate::config::AccountMode::Team,
+                12,
+                None,
+                &config.codex.extra_state_blocks,
+            );
+            println!("个人接受块数: {personal:?}");
+            println!("Team 接受块数: {team:?}");
+            println!("额外块数: {:?}", config.codex.extra_state_blocks);
+            println!("说明: 块数只是封装形状，不代表模型质量。");
+        }
+        StateAction::AddBlock { blocks } => {
+            if !(1..=128).contains(&blocks) {
+                bail!("blocks must be 1-128");
+            }
+            if !config.codex.extra_state_blocks.contains(&blocks) {
+                config.codex.extra_state_blocks.push(blocks);
+                config.codex.extra_state_blocks.sort_unstable();
+                config.save(paths)?;
+            }
+            println!("已接受新的 state 块数: {blocks}");
+        }
+        StateAction::RemoveBlock { blocks } => {
+            config
+                .codex
+                .extra_state_blocks
+                .retain(|value| *value != blocks);
+            config.save(paths)?;
+            println!("已移除额外 state 块数: {blocks}");
+        }
     }
     Ok(())
 }

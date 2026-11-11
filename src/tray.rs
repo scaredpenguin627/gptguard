@@ -74,7 +74,7 @@ mod imp {
             let icon = build_icon();
             let tray = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
-                .with_tooltip("ChatGPTGuard · AIGuard")
+                .with_tooltip("GPTGuard")
                 .with_icon(icon)
                 .build()
                 .context("create tray icon")?;
@@ -118,7 +118,7 @@ mod imp {
             ));
             tray._tray
                 .set_tooltip(Some(format!(
-                    "ChatGPTGuard\n{label}\nHTTP: {}\nSTUN: {}",
+                    "GPTGuard\n{label}\nHTTP: {}\nSTUN: {}",
                     state.http_ip.as_deref().unwrap_or("-"),
                     state.stun_ip.as_deref().unwrap_or("-")
                 )))
@@ -185,7 +185,7 @@ mod imp {
                     };
                     let _ = client
                         .post(&url)
-                        .header("x-aiguard-token", token)
+                        .header("x-gptguard-token", token)
                         .json(&body)
                         .send()
                         .await;
@@ -217,7 +217,7 @@ mod imp {
                     };
                     let Ok(response) = client
                         .get(&url)
-                        .header("x-aiguard-token", &token)
+                        .header("x-gptguard-token", &token)
                         .send()
                         .await
                     else {
@@ -235,7 +235,7 @@ mod imp {
                     };
                     let _ = client
                         .post(&post_url)
-                        .header("x-aiguard-token", &token)
+                        .header("x-gptguard-token", &token)
                         .json(&serde_json::json!({ "enabled": !enabled }))
                         .send()
                         .await;
@@ -361,7 +361,7 @@ mod imp {
                 return Ok(());
             }
         }
-        anyhow::bail!("守护启动超时；请从命令行运行 aiguard run 查看错误")
+        anyhow::bail!("守护启动超时；请从命令行运行 gptguard run 查看错误")
     }
 
     fn daemon_alive(paths: &AppPaths) -> bool {
@@ -374,5 +374,5 @@ pub use imp::run;
 
 #[cfg(not(windows))]
 pub fn run(_start_guard: bool) -> anyhow::Result<()> {
-    anyhow::bail!("托盘目前只支持 Windows；其他平台请使用 aiguard run 和网页面板")
+    anyhow::bail!("托盘目前只支持 Windows；其他平台请使用 gptguard run 和网页面板")
 }

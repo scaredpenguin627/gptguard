@@ -47,46 +47,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aiguard"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "clap",
- "dirs",
- "flate2",
- "fs2",
- "futures-util",
- "http",
- "ipnet",
- "libc",
- "open",
- "rand 0.8.8",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "sysinfo",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "toml",
- "toml_edit",
- "tracing",
- "tracing-subscriber",
- "tray-icon",
- "url",
- "uuid",
- "winit",
- "winreg",
- "zstd",
-]
-
-[[package]]
 name = "android-activity"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -966,6 +926,46 @@ dependencies = [
  "r-efi 6.0.0",
  "rand_core 0.10.1",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "gptguard"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "clap",
+ "dirs",
+ "flate2",
+ "fs2",
+ "futures-util",
+ "http",
+ "ipnet",
+ "libc",
+ "open",
+ "rand 0.8.8",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "tracing",
+ "tracing-subscriber",
+ "tray-icon",
+ "url",
+ "uuid",
+ "winit",
+ "winreg",
+ "zstd",
 ]
 
 [[package]]

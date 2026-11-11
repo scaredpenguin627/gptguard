@@ -1,4 +1,4 @@
-# ChatGPTGuard / AIGuard
+# GPTGuard
 
 面向 ChatGPT 和 Codex 的本地出口守卫与 turn-state 转发器。Windows 优先，Rust 实现。
 
@@ -38,6 +38,10 @@ state 是服务端签发的不透明密文。本项目只解析长度、时间�
 | 固定模型 | 写入 Codex `config.toml` 的 `model`，并同步已接管的配置 |
 | 托盘与面板 | Windows 通知区菜单；本机 Web 面板；状态、白名单、接管、采集、日志、自启动 |
 
+## 下载
+
+Windows x64 预编译包放在 [Releases](https://github.com/scaredpenguin627/gptguard/releases/latest)。源码构建见下。
+
 ## 快速开始
 
 ### 1. 构建
@@ -55,22 +59,22 @@ rustup toolchain install stable-x86_64-pc-windows-gnu
 rustup run stable-x86_64-pc-windows-gnu cargo build --release
 ```
 
-生成 `target\release\aiguard.exe`。把所在目录加入 PATH，或直接用完整路径运行。
+生成 `target\release\gptguard.exe`。把所在目录加入 PATH，或直接用完整路径运行。
 
 ### 2. 初始化
 
 ```powershell
-aiguard setup
+gptguard setup
 ```
 
-命令会创建 `%APPDATA%\AIGuard\config.json`，并打印管理口令和面板地址。
+命令会创建 `%APPDATA%\GPTGuard\config.json`，并打印管理口令和面板地址。
 
 ### 3. 填写可信出口
 
 ```powershell
-aiguard add-ip 203.0.113.10
-aiguard add-ip 198.51.100.0/24
-aiguard set ip-check-mode both
+gptguard add-ip 203.0.113.10
+gptguard add-ip 198.51.100.0/24
+gptguard set ip-check-mode both
 ```
 
 白名单留空时，守护按失败处理。
@@ -80,14 +84,14 @@ aiguard set ip-check-mode both
 先正常登录 Codex，确认不经过本工具也能使用。然后：
 
 ```powershell
-aiguard codex takeover --auth chatgpt
+gptguard codex takeover --auth chatgpt
 ```
 
-接管会备份原文件，把 `model_provider` 改成 `aiguard`，并写入：
+接管会备份原文件，把 `model_provider` 改成 `gptguard`，并写入：
 
 ```toml
-[model_providers.aiguard]
-name = "ChatGPTGuard"
+[model_providers.gptguard]
+name = "GPTGuard"
 base_url = "http://127.0.0.1:17841/backend-api/codex"
 wire_api = "responses"
 requires_openai_auth = true
@@ -98,7 +102,7 @@ requires_openai_auth = true
 恢复原配置：
 
 ```powershell
-aiguard codex restore
+gptguard codex restore
 ```
 
 如果接管后手动改过 `config.toml`，恢复会被拒绝。确认要覆盖时加 `--force`，当前文件会另存备份。
@@ -106,13 +110,13 @@ aiguard codex restore
 ### 5. 启动
 
 ```powershell
-aiguard run
+gptguard run
 ```
 
 或启动托盘。托盘会确保守护在运行：
 
 ```powershell
-aiguard tray
+gptguard tray
 ```
 
 需要修改 hosts、防火墙或更新锁时，在管理员终端里启动守护。普通权限下仍可检测出口和终止进程，但状态会显示执行层错误。
@@ -120,7 +124,7 @@ aiguard tray
 ### 6. 打开面板
 
 ```powershell
-aiguard web
+gptguard web
 ```
 
 默认地址 `http://127.0.0.1:17842`。口令在 `config.json` 的 `ui.admin_token`，`setup` 也会打印。
@@ -129,32 +133,36 @@ aiguard web
 
 | 命令 | 作用 |
 |---|---|
-| `aiguard setup` | 创建配置，显示下一步 |
-| `aiguard run` | 启动守护：出口检测、Codex 转发、管理面板 |
-| `aiguard tray` | 启动 Windows 托盘，并确保守护在运行 |
-| `aiguard status` | 读取守护状态 |
-| `aiguard check` | 立即检测出口；未通过时退出码为 1 |
-| `aiguard doctor` | 检查权限、hosts、目标程序、配置目录、白名单 |
-| `aiguard add-ip <IP/CIDR>` | 加入白名单 |
-| `aiguard remove-ip <IP/CIDR>` | 移出白名单 |
-| `aiguard list-ips` | 列出白名单 |
-| `aiguard set <key> <value>` | 修改配置，见下表 |
-| `aiguard model <model>` | 固定 Codex 模型 |
-| `aiguard codex takeover` | 接管 Codex 配置 |
-| `aiguard codex restore` | 恢复原配置 |
-| `aiguard codex status` | 查看接管事务 |
-| `aiguard codex probe` | 单独执行一次 state 采集 |
-| `aiguard update-lock on\|off` | 开启或关闭自动更新锁定 |
-| `aiguard autostart on\|off` | 开启或关闭登录自启动 |
-| `aiguard guard -- <命令>` | 先检测出口，再启动命令；运行中失配会终止子进程 |
+| `gptguard setup` | 创建配置，显示下一步 |
+| `gptguard run` | 启动守护：出口检测、Codex 转发、管理面板 |
+| `gptguard tray` | 启动 Windows 托盘，并确保守护在运行 |
+| `gptguard status` | 读取守护状态 |
+| `gptguard check` | 立即检测出口；未通过时退出码为 1 |
+| `gptguard doctor` | 检查权限、hosts、目标程序、配置目录、白名单 |
+| `gptguard add-ip <IP/CIDR>` | 加入白名单 |
+| `gptguard remove-ip <IP/CIDR>` | 移出白名单 |
+| `gptguard list-ips` | 列出白名单 |
+| `gptguard set <key> <value>` | 修改配置，见下表 |
+| `gptguard model <model>` | 固定 Codex 模型 |
+| `gptguard models list` | 查看模型目录和校准规则 |
+| `gptguard models add <model>` | 手动加入模型目录 |
+| `gptguard state list` | 查看接受的 state 块数 |
+| `gptguard state add-block <n>` | 接受新的 state 块数 |
+| `gptguard codex takeover` | 接管 Codex 配置 |
+| `gptguard codex restore` | 恢复原配置 |
+| `gptguard codex status` | 查看接管事务 |
+| `gptguard codex probe` | 单独执行一次 state 采集 |
+| `gptguard update-lock on\|off` | 开启或关闭自动更新锁定 |
+| `gptguard autostart on\|off` | 开启或关闭登录自启动 |
+| `gptguard guard -- <命令>` | 先检测出口，再启动命令；运行中失配会终止子进程 |
 
-`aiguard set` 支持的键：
+`gptguard set` 支持的键：
 
 | 键 | 值 |
 |---|---|
 | `ip-check-mode` | `both`、`http`、`stun` |
 | `interval` | 检测间隔秒数，1–300 |
-| `model` | `gpt-6-astra`、`gpt-5.6-sol`、`gpt-5.6-terra` |
+| `model` | 任意合法 model id，例如 `gpt-6.2-astra`；不再限制为三个内置名字 |
 | `fallback` | `strict`、`passthrough` |
 | `account-mode` | `auto`、`personal`、`team` |
 | `fixed-model` | `true`、`false` |
@@ -168,27 +176,51 @@ aiguard web
 
 | 内容 | Windows |
 |---|---|
-| 配置 | `%APPDATA%\AIGuard\config.json` |
-| 状态 | `%LOCALAPPDATA%\AIGuard\state.json` |
-| 日志 | `%LOCALAPPDATA%\AIGuard\logs\` |
-| Codex 备份 | `%LOCALAPPDATA%\AIGuard\backups\` |
-| 锁文件 | `%LOCALAPPDATA%\AIGuard\aiguard.lock`、`tray.lock` |
+| 配置 | `%APPDATA%\GPTGuard\config.json` |
+| 状态 | `%LOCALAPPDATA%\GPTGuard\state.json` |
+| 日志 | `%LOCALAPPDATA%\GPTGuard\logs\` |
+| Codex 备份 | `%LOCALAPPDATA%\GPTGuard\backups\` |
+| 锁文件 | `%LOCALAPPDATA%\GPTGuard\gptguard.lock`、`tray.lock` |
 | Codex 配置 | `%USERPROFILE%\.codex\config.toml`，或 `CODEX_HOME` |
 
 配置里的代理 URL 可能包含账号密码。面板返回时会打码。日志不记录完整 state、Authorization、订阅 URL 或代理凭据。
 
+## 模型更新
+
+模型列表不是访问白名单。`gptguard` 只检查 model id 的语法，未知模型照常转发。校准分类按前缀判断，默认：
+
+- 以 `gpt-` 或 `o` 开头：进入 state 采集和注入。
+- 以 `codex-` 开头，或在 `auxiliary_models` 里：直通，不采集、不注入。
+
+Codex 调用 `/models` 时，网关会读取响应里的 model id，自动追加到 `codex.models`。这样 6.1、6.2 或之后的新名字不需要改代码。也可以手动维护：
+
+```powershell
+gptguard models list
+gptguard models add gpt-6.2-astra
+gptguard model gpt-6.2-astra
+```
+
+如果新模型改变了 state 块数，先看 `gptguard state list`，再把观察到的块数加入：
+
+```powershell
+gptguard state add-block 33
+```
+
+块数只是封装形状，不代表模型质量。不要为了“凑满血”随意接受未知形状。
+
 ## turn-state 规则
 
-| 账号规则 | 接受块数 | 通常长度 |
+| 账号规则 | 默认接受块数 | 通常长度 |
 |---|---|---|
 | 个人 | 10 或 33 | 292 或 780 |
 | Team/Business | 12 或 33 | 332 或 780 |
 | 显式旧版自定义基线 | 只接受原值 | 按原值 |
+| `extra_state_blocks` | 追加任意 1–128 | 按块数计算 |
 
 估计 TTL 为 3600 秒。最后 30 秒不再接纳。没有可用 state 时：
 
 - `strict`：返回 503 `state_unavailable`，不转发。
-- `passthrough`：本次请求不注入 state，照常转发一次，并加 `X-AIGuard-Mode: fallback-passthrough`。
+- `passthrough`：本次请求不注入 state，照常转发一次，并加 `X-GPTGuard-Mode: fallback-passthrough`。
 
 两种模式都不会在收到上游响应后重放请求。
 

@@ -44,6 +44,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/whitelist", post(api_whitelist))
         .route("/api/doctor", get(api_status))
         .route("/api/logs", get(api_logs))
+        .route("/api/codex/model", post(api_model))
+        .route("/api/codex/state-block", post(api_state_block))
         .route("/api/codex/takeover", post(api_takeover))
         .route("/api/codex/restore", post(api_restore))
         .route("/api/codex/probe", post(api_probe))
@@ -92,7 +94,7 @@ fn authorized(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
         ));
     }
     let token = headers
-        .get("x-aiguard-token")
+        .get("x-gptguard-token")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     if token != state.config().ui.admin_token {
@@ -154,6 +156,10 @@ fn config_view(cfg: &Config) -> serde_json::Value {
             "listen": cfg.codex.listen,
             "model": cfg.codex.model,
             "fixed_model": cfg.codex.fixed_model,
+            "models": cfg.codex.models,
+            "calibration_prefixes": cfg.codex.calibration_prefixes,
+            "auxiliary_models": cfg.codex.auxiliary_models,
+            "extra_state_blocks": cfg.codex.extra_state_blocks,
             "account_mode": cfg.codex.account_mode,
             "state_fallback": cfg.codex.state_fallback,
             "injection": cfg.codex.injection,
@@ -280,6 +286,94 @@ async fn api_logs(State(state): State<AppState>, headers: HeaderMap) -> Response
         Json(serde_json::json!({"ok": true, "log": text})),
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+struct ModelBody {
+    model: String,
+}
+
+async fn api_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ModelBody>,
+) -> Response {
+    if let Err(response) = authorized(&state, &headers) {
+        return response;
+    }
+    let model = body.model.trim().to_string();
+    if !crate::config::valid_model_id(&model) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_model", "model 名称不合法");
+    }
+    let mut cfg = state.config();
+    cfg.codex.model = model.clone();
+    cfg.codex.fixed_model = true;
+    if !cfg.codex.models.iter().any(|entry| entry == &model) {
+        cfg.codex.models.push(model.clone());
+    }
+    if let Err(err) = state.save_config(&cfg) {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "save_failed",
+            &format!("{err:#}"),
+        );
+    }
+    match config_tx::set_installed_model(&cfg, &state.paths, &model) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "installed": true})),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "installed": false})),
+        )
+            .into_response(),
+        Err(err) => api_error(
+            StatusCode::CONFLICT,
+            "model_write_failed",
+            &format!("{err:#}"),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct StateBlockBody {
+    blocks: usize,
+    enabled: bool,
+}
+
+async fn api_state_block(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<StateBlockBody>,
+) -> Response {
+    if let Err(response) = authorized(&state, &headers) {
+        return response;
+    }
+    if !(1..=128).contains(&body.blocks) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_blocks",
+            "blocks 必须在 1-128",
+        );
+    }
+    let mut cfg = state.config();
+    cfg.codex
+        .extra_state_blocks
+        .retain(|value| *value != body.blocks);
+    if body.enabled {
+        cfg.codex.extra_state_blocks.push(body.blocks);
+        cfg.codex.extra_state_blocks.sort_unstable();
+    }
+    if let Err(err) = state.save_config(&cfg) {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "save_failed",
+            &format!("{err:#}"),
+        );
+    }
+    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
 #[derive(Deserialize, Default)]

@@ -121,7 +121,7 @@ pub async fn check(config: &Config) -> IpReport {
 async fn check_http(proxy: Option<&str>) -> Result<IpAddr> {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
-        .user_agent(concat!("AIGuard/", env!("CARGO_PKG_VERSION")));
+        .user_agent(concat!("GPTGuard/", env!("CARGO_PKG_VERSION")));
     if let Some(proxy) = proxy {
         builder = builder.proxy(reqwest::Proxy::all(proxy).context("invalid HTTP proxy")?);
     }

@@ -22,7 +22,7 @@
 |---|---|---|---|---|
 | PR #1 / issue #1，`5ee2eac` | 其他人的代码 | Windows 通知区托盘、中文菜单、登录启动、单实例 | 已合入 | `src/tray.rs`、`src/guard.rs` 的 `set_autostart`、`tray.lock` |
 | 文档缺口 | 功能 | Windows 端自动更新锁定 | 已合入 | `src/guard.rs` 的 `update_lock` / `remove_update_lock` |
-| 文档缺口 | 功能 | Windows 端固定模型 | 已合入 | `src/codex/config_tx.rs`、`aiguard model` |
+| 文档缺口 | 功能 | Windows 端固定模型 | 已合入 | `src/codex/config_tx.rs`、`gptguard model` |
 | 上游 macOS 菜单栏 | 功能 | AppKit 菜单栏与 Swift 守护 | 未合入 | 新项目用跨平台托盘代替；macOS 托盘本轮不提供 |
 | 上游 Windows WFP 助手 | 功能 | 按 exe 的 WFP 内核过滤 | 未合入 | 改为 `netsh advfirewall` 按 exe 规则；没有内核驱动 |
 | 上游 Linux cgroup/nftables | 功能 | cgroup v2 + nftables | 未合入 | 本轮只做 Windows 执行层 |
@@ -55,6 +55,25 @@ ClaudeGuard 有 4 个 fork，ccodex-sleep-state 有 145 个 fork。没有逐个�
 - fork 里常见的是改配置、换图标、私有节点和未整理的实验代码，直接合并会带入凭据或无关改动。
 - 有明确说明、可审查的改动已经通过 PR 分支提交。PR #1、#11、#14 都是其他人的代码，已按 PR 分支审阅后移植到 Rust。
 - 需要某个 fork 的特定修复时，请给出 fork URL 和提交号，我再按同样方式审查。
+
+## 模型升级策略
+
+旧版把 `gpt-6-astra`、`gpt-5.6-sol`、`gpt-5.6-terra` 写死在代码里，新增模型会被当成未知模型或直接拒绝。新版改成三层：
+
+1. `codex.models` 是提示目录，不是访问白名单。未知 model id 只检查语法，照常转发。
+2. 校准按前缀分类。默认 `gpt-*`、`o*` 进入 state 采集，`codex-*` 和 `auxiliary_models` 直通。
+3. Codex 请求 `/models` 时，网关读取响应并自动把新 id 写入 `codex.models`。
+
+已经预置 6.1 和 6.2 的名字：
+
+```text
+gpt-6.1-sol
+gpt-6.1-terra
+gpt-6.2-astra
+gpt-6.2-sol
+```
+
+新模型改变 state 块数时，用 `gptguard state add-block <n>` 追加，不改代码。
 
 ## 本轮没有做的事
 

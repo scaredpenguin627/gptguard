@@ -1,12 +1,12 @@
 [package]
-name = "aiguard"
-version = "0.1.1"
+name = "gptguard"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["scaredpenguin627"]
-description = "ChatGPTGuard / AIGuard: egress guard and Codex turn-state relay for ChatGPT and Codex"
+description = "GPTGuard / GPTGuard: egress guard and Codex turn-state relay for ChatGPT and Codex"
 license = "GPL-3.0-only"
-repository = "https://github.com/scaredpenguin627/aiguard"
+repository = "https://github.com/scaredpenguin627/gptguard"
 readme = "README.md"
 keywords = ["chatgpt", "codex", "proxy", "egress", "windows"]
 categories = ["command-line-utilities", "network-programming"]

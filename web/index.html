@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ChatGPTGuard · AIGuard</title>
+<title>GPTGuard</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -68,7 +68,7 @@
 <body>
 <main>
   <header>
-    <h1>🛡️ ChatGPTGuard <span>AIGuard · 本地出口守卫与 Codex 转发</span></h1>
+    <h1>GPTGuard <span>本地出口守卫与 Codex 转发</span></h1>
     <div class="row">
       <span id="statusPill" class="pill stopped">读取中</span>
       <button id="checkBtn" class="primary">立即检测</button>
@@ -134,6 +134,17 @@
         <button id="restore">恢复原配置</button>
         <button id="probe">测试采集</button>
       </div>
+      <label for="modelInput">固定模型（写入 Codex 配置）</label>
+      <div class="row">
+        <input id="modelInput" placeholder="gpt-6.2-astra" style="flex:1;min-width:200px">
+        <button id="setModel">写入模型</button>
+      </div>
+      <label for="blockInput">额外的 state 块数（1–128）</label>
+      <div class="row">
+        <input id="blockInput" type="number" min="1" max="128" placeholder="例如 33" style="max-width:140px">
+        <button id="addBlock">接受</button>
+        <button id="removeBlock">移除</button>
+      </div>
       <label for="subscription">订阅 / 代理列表 URL</label>
       <div class="row">
         <input id="subscription" placeholder="https://example.com/sub" style="flex:1;min-width:220px">
@@ -175,14 +186,14 @@
   let token = (() => {
     const match = location.hash.match(/token=([^&]+)/);
     if (match) {
-      sessionStorage.setItem('aiguard_token', decodeURIComponent(match[1]));
+      sessionStorage.setItem('gptguard_token', decodeURIComponent(match[1]));
       history.replaceState(null, '', location.pathname);
       return decodeURIComponent(match[1]);
     }
-    return sessionStorage.getItem('aiguard_token') || '';
+    return sessionStorage.getItem('gptguard_token') || '';
   })();
   if (!token) token = prompt('请输入管理口令（启动输出中的 #token=）') || '';
-  if (token) sessionStorage.setItem('aiguard_token', token);
+  if (token) sessionStorage.setItem('gptguard_token', token);
 
   const toast = (message) => {
     const box = $('toast');
@@ -195,7 +206,7 @@
   async function api(path, body) {
     const response = await fetch(path, {
       method: body === undefined ? 'GET' : 'POST',
-      headers: { 'x-aiguard-token': token, 'content-type': 'application/json' },
+      headers: { 'x-gptguard-token': token, 'content-type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const data = await response.json().catch(() => ({}));
@@ -300,6 +311,18 @@
     toast(data.probe?.detail || '采集完成');
     return data;
   }, '采集完成');
+
+  $('setModel').onclick = () => act(() => api('/api/codex/model', { model: $('modelInput').value }), '模型已写入');
+
+  $('addBlock').onclick = () => act(() => api('/api/codex/state-block', {
+    blocks: Number($('blockInput').value),
+    enabled: true,
+  }), '已接受新的 state 块数');
+
+  $('removeBlock').onclick = () => act(() => api('/api/codex/state-block', {
+    blocks: Number($('blockInput').value),
+    enabled: false,
+  }), '已移除 state 块数');
 
   $('importSub').onclick = () => act(() => api('/api/codex/subscription', { url: $('subscription').value }), '订阅已导入');
 

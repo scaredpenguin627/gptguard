@@ -11,9 +11,9 @@ use axum::routing::post;
 use axum::Router;
 use serde_json::json;
 
-use aiguard::codex::proxy::ProxyRuntime;
-use aiguard::codex::turnstate;
-use aiguard::config::{AppPaths, Config};
+use gptguard::codex::proxy::ProxyRuntime;
+use gptguard::codex::turnstate;
+use gptguard::config::{AppPaths, Config};
 
 #[derive(Clone)]
 struct MockState {
@@ -31,6 +31,16 @@ async fn mock(State(state): State<MockState>, headers: HeaderMap, body: String) 
         .unwrap()
 }
 
+async fn mock_models() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"data":[{"id":"gpt-6.3-nova"},{"id":"gpt-6.2-sol"}]}"#,
+        ))
+        .unwrap()
+}
+
 fn temp_paths(root: &std::path::Path) -> AppPaths {
     AppPaths {
         config_dir: root.join("config"),
@@ -39,7 +49,7 @@ fn temp_paths(root: &std::path::Path) -> AppPaths {
         state_file: root.join("data/state.json"),
         log_dir: root.join("data/logs"),
         backups_dir: root.join("data/backups"),
-        lock_file: root.join("data/aiguard.lock"),
+        lock_file: root.join("data/gptguard.lock"),
     }
 }
 
@@ -55,6 +65,7 @@ async fn forwards_aux_models_and_injects_33_block_state() {
     };
     let mock_router = Router::new()
         .route("/v1/responses", post(mock))
+        .route("/v1/models", axum::routing::get(mock_models))
         .with_state(mock_state);
     tokio::spawn(async move {
         axum::serve(listener, mock_router).await.unwrap();
@@ -73,8 +84,8 @@ async fn forwards_aux_models_and_injects_33_block_state() {
     config.codex.upstream_kind = "official".into();
     config.codex.direct = true;
     config.codex.injection = true;
-    config.codex.state_fallback = aiguard::config::StateFallback::Strict;
-    let proxy = ProxyRuntime::new(config, paths).unwrap();
+    config.codex.state_fallback = gptguard::config::StateFallback::Strict;
+    let proxy = ProxyRuntime::new(config, paths.clone()).unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let running = proxy.clone();
     tokio::spawn(async move {
@@ -89,6 +100,24 @@ async fn forwards_aux_models_and_injects_33_block_state() {
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{proxy_port}/backend-api/codex/responses");
     let auth = "Bearer test-token-1234567890";
+
+    let models = client
+        .get(format!(
+            "http://127.0.0.1:{proxy_port}/backend-api/codex/models"
+        ))
+        .header("authorization", auth)
+        .header("chatgpt-account-id", "acct")
+        .header("host", format!("127.0.0.1:{proxy_port}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(models.status(), 200);
+    let _ = models.text().await.unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&paths.config_file).unwrap()).unwrap();
+    let discovered = saved["codex"]["models"].as_array().unwrap();
+    assert!(discovered.iter().any(|model| model == "gpt-6.3-nova"));
+    assert!(discovered.iter().any(|model| model == "gpt-6.2-sol"));
 
     let aux = client
         .post(&base)

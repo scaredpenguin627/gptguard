@@ -14,10 +14,10 @@ use serde::{Deserialize, Serialize};
 use crate::config::{Config, TargetConfig};
 use crate::util;
 
-pub const GUARD_BEGIN: &str = "# BEGIN AIGuard egress block";
-pub const GUARD_END: &str = "# END AIGuard egress block";
-pub const UPDATE_BEGIN: &str = "# BEGIN AIGuard update lock";
-pub const UPDATE_END: &str = "# END AIGuard update lock";
+pub const GUARD_BEGIN: &str = "# BEGIN GPTGuard egress block";
+pub const GUARD_END: &str = "# END GPTGuard egress block";
+pub const UPDATE_BEGIN: &str = "# BEGIN GPTGuard update lock";
+pub const UPDATE_END: &str = "# END GPTGuard update lock";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -139,7 +139,7 @@ fn firewall_rule_name(target: &TargetConfig) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    format!("AIGuard Block {label}")
+    format!("GPTGuard Block {label}")
 }
 
 pub fn apply_firewall(targets: &[TargetConfig]) -> Result<()> {
@@ -362,7 +362,7 @@ pub fn autostart_enabled() -> bool {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
             .ok()
-            .and_then(|key| key.get_value::<String, _>("AIGuard").ok())
+            .and_then(|key| key.get_value::<String, _>("GPTGuard").ok())
             .is_some()
     }
     #[cfg(not(windows))]
@@ -381,9 +381,9 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
         if enabled {
             let exe = util::exe_path();
             let command = format!("\"{}\" tray --start-guard", exe.display());
-            key.set_value("AIGuard", &command)?;
+            key.set_value("GPTGuard", &command)?;
         } else {
-            let _ = key.delete_value("AIGuard");
+            let _ = key.delete_value("GPTGuard");
         }
         Ok(())
     }
@@ -431,7 +431,7 @@ pub fn doctor(config: &Config) -> Vec<(String, bool, String)> {
     rows.push((
         "登录自启动".into(),
         autostart_enabled(),
-        "HKCU Run: AIGuard".into(),
+        "HKCU Run: GPTGuard".into(),
     ));
     rows
 }

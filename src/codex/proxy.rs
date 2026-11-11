@@ -218,6 +218,34 @@ impl ProxyRuntime {
         }
     }
 
+    /// Codex already calls the models endpoint. Learn new ids from that
+    /// response so a 6.1/6.2 release does not require a binary update.
+    pub fn learn_models(&self, ids: Vec<String>) {
+        let mut config = self.inner.config.read().unwrap().clone();
+        let mut changed = false;
+        for id in ids {
+            if !crate::config::valid_model_id(&id) {
+                continue;
+            }
+            if config.codex.models.iter().any(|entry| entry == &id) {
+                continue;
+            }
+            if config.codex.models.len() >= 256 {
+                break;
+            }
+            config.codex.models.push(id);
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        if let Err(err) = config.save(&self.inner.paths) {
+            util::warn(format!("persist discovered models: {err:#}"));
+            return;
+        }
+        *self.inner.config.write().unwrap() = config;
+    }
+
     fn check_local(&self, headers: &HeaderMap) -> Result<(), Response> {
         let listen = self.listen();
         let host = headers
@@ -277,14 +305,14 @@ async fn not_found() -> Response {
     local_error(
         StatusCode::NOT_FOUND,
         "unsupported_endpoint",
-        "此路径不由 AIGuard 转发",
+        "此路径不由 GPTGuard 转发",
     )
 }
 
 fn local_error(status: StatusCode, code: &str, message: &str) -> Response {
     let body = serde_json::json!({
         "error": {
-            "type": "aiguard_error",
+            "type": "gptguard_error",
             "code": code,
             "message": message
         }
@@ -292,7 +320,7 @@ fn local_error(status: StatusCode, code: &str, message: &str) -> Response {
     (
         status,
         [
-            ("X-AIGuard-Error-Source", "local"),
+            ("X-GPTGuard-Error-Source", "local"),
             ("Cache-Control", "no-store"),
         ],
         axum::Json(body),
@@ -350,7 +378,8 @@ async fn handle_passthrough(
         }
     };
     let path = request.uri().path().to_string();
-    let suffix = if path.ends_with("/models") {
+    let is_models = path.ends_with("/models");
+    let suffix = if is_models {
         "/models"
     } else {
         "/alpha/search"
@@ -388,6 +417,36 @@ async fn handle_passthrough(
         }
     };
     state.bump_requests();
+    if is_models && response.status().is_success() {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = match response.bytes().await {
+            Ok(body) if body.len() <= 2 * 1024 * 1024 => body,
+            _ => {
+                return local_error(
+                    StatusCode::BAD_GATEWAY,
+                    "models_unreadable",
+                    "无法读取模型列表",
+                )
+            }
+        };
+        if let Ok(ids) = extract_model_ids(&body) {
+            state.learn_models(ids);
+        }
+        let mut builder = Response::builder()
+            .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
+        for (name, value) in &headers {
+            if !matches!(
+                name.as_str().to_ascii_lowercase().as_str(),
+                "content-length" | "transfer-encoding" | "connection"
+            ) {
+                builder = builder.header(name, value);
+            }
+        }
+        return builder
+            .body(Body::from(body))
+            .unwrap_or_else(|_| local_error(StatusCode::BAD_GATEWAY, "models", "无法构造响应"));
+    }
     relay_response(response)
 }
 
@@ -430,7 +489,7 @@ async fn handle_generation(state: ProxyRuntime, request: Request<Body>, compact:
     if !provider::valid_model_name(&model) {
         return local_error(StatusCode::BAD_REQUEST, "invalid_model", "model 名称不合法");
     }
-    let calibration = provider::is_calibration_model(&model);
+    let calibration = provider::is_calibration_model(&config.codex, &model);
     let inject = !compact && calibration && selection.official && config.codex.injection;
 
     let auth = parts
@@ -678,7 +737,7 @@ async fn forward_generation(
     let mut response = relay_response(response);
     if fallback_passthrough {
         response.headers_mut().insert(
-            "x-aiguard-mode",
+            "x-gptguard-mode",
             HeaderValue::from_static("fallback-passthrough"),
         );
     }
@@ -927,8 +986,12 @@ fn policy_for(config: &Config, headers: &HeaderMap, _model: &str) -> (Policy, St
             .get("ChatGPT-Account-Id")
             .and_then(|value| value.to_str().ok()),
     );
-    let (blocks, source) =
-        provider::accepted_blocks(&config.codex.account_mode, 10, hint.as_deref());
+    let (blocks, source) = provider::accepted_blocks_with_extra(
+        &config.codex.account_mode,
+        10,
+        hint.as_deref(),
+        &config.codex.extra_state_blocks,
+    );
     (
         Policy::new(
             blocks,
@@ -1065,6 +1128,46 @@ async fn read_probe_stream(response: reqwest::Response) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+fn extract_model_ids(body: &[u8]) -> Result<Vec<String>> {
+    let value: serde_json::Value =
+        serde_json::from_slice(body).context("models response is not JSON")?;
+    let mut ids = Vec::new();
+    collect_model_ids(&value, &mut ids);
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn collect_model_ids(value: &serde_json::Value, ids: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_model_ids(item, ids);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for key in ["id", "model", "slug"] {
+                if let Some(id) = map.get(key).and_then(|value| value.as_str()) {
+                    let candidate = id.to_ascii_lowercase();
+                    if crate::config::valid_model_id(id)
+                        && (candidate.starts_with("gpt-")
+                            || candidate.starts_with("o")
+                            || candidate.contains("codex"))
+                    {
+                        ids.push(id.to_string());
+                    }
+                }
+            }
+            for key in ["data", "models", "items"] {
+                if let Some(child) = map.get(key) {
+                    collect_model_ids(child, ids);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn hash_key(value: &str) -> String {

@@ -114,7 +114,7 @@ pub async fn run(config: Config, paths: AppPaths, open_panel: bool) -> Result<()
     let proxy = ProxyRuntime::new(cfg.clone(), paths.clone())?;
     if !cfg.protection.enabled && cfg.protection.network_guard {
         // A previous daemon may have been force-killed while blocked. Clear
-        // AIGuard's own hosts/firewall entries on a clean disabled start.
+        // GPTGuard's own hosts/firewall entries on a clean disabled start.
         let report = guard::enforce(&cfg, false);
         if !report.errors.is_empty() {
             util::warn(format!(
@@ -185,7 +185,7 @@ pub async fn run(config: Config, paths: AppPaths, open_panel: bool) -> Result<()
         }
     });
 
-    util::info(format!("AIGuard daemon started; panel {panel_url}"));
+    util::info(format!("GPTGuard daemon started; panel {panel_url}"));
     if open_panel || cfg.ui.open_panel_on_start {
         let _ = util::open_url(&panel_url);
     }
@@ -360,7 +360,7 @@ fn acquire_instance_lock(paths: &AppPaths) -> Result<fs::File> {
         .with_context(|| format!("open lock {}", paths.lock_file.display()))?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(file),
-        Err(_) => bail!("AIGuard 守护已经在运行（{}）", paths.lock_file.display()),
+        Err(_) => bail!("GPTGuard 守护已经在运行（{}）", paths.lock_file.display()),
     }
 }
 

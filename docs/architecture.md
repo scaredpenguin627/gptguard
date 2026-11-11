@@ -6,14 +6,14 @@
 Codex CLI
    │  HTTP/SSE (localhost)
    ▼
-aiguard run ── 127.0.0.1:17841 ── Codex 网关
+gptguard run ── 127.0.0.1:17841 ── Codex 网关
    │
    ├── 出口检测循环（HTTP + STUN）
    ├── Windows 执行层（hosts / 防火墙 / 进程）
    ├── 127.0.0.1:17842 ── 管理面板
    └── state.json / logs / backups
 
-aiguard tray ── 读 state.json，调用 17842 API
+gptguard tray ── 读 state.json，调用 17842 API
 ```
 
 一个守护进程，一个托盘客户端。托盘不持有执行层，关闭托盘不影响防护。
@@ -75,8 +75,8 @@ Codex POST /backend-api/codex/responses
 
 1. 读取并解析 `config.toml`。
 2. 解析 provider 和认证方式。
-3. 备份原文件到 `%LOCALAPPDATA%\AIGuard\backups\`。
-4. 用 `toml_edit` 写入 `model_provider = "aiguard"` 和 `[model_providers.aiguard]`。
+3. 备份原文件到 `%LOCALAPPDATA%\GPTGuard\backups\`。
+4. 用 `toml_edit` 写入 `model_provider = "gptguard"` 和 `[model_providers.gptguard]`。
 5. 记录原文件哈希、安装后哈希、上游、认证类型、profile。
 6. 原子替换。
 
@@ -86,7 +86,7 @@ Codex POST /backend-api/codex/responses
 
 - 只监听回环地址。
 - 网关拒绝带 `Origin` 或 `Sec-Fetch-Site` 的请求，避免浏览器页面直接调用。
-- 面板要求 `x-aiguard-token`，并校验 Host 与 Origin。
+- 面板要求 `x-gptguard-token`，并校验 Host 与 Origin。
 - 不读取 `auth.json`，不刷新 OAuth，不把凭据写到磁盘。
 - 日志不记录 Authorization、完整 state、订阅 URL 或代理凭据。
 - 中转 provider 清除 ChatGPT 专用头；官方 OAuth 凭据误发到中转时本地拒绝。

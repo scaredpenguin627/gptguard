@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use toml::Value;
 
-use crate::config::{AccountMode, SUPPORTED_MODELS};
+use crate::config::{valid_model_id, AccountMode, CodexConfig};
 
 pub const OFFICIAL_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex";
 pub const API_UPSTREAM: &str = "https://api.openai.com/v1";
@@ -79,7 +79,7 @@ pub fn resolve(original: &str, profile: Option<&str>, auth_mode: &str) -> Result
         Some(Value::String(_)) | None => "openai".to_string(),
         Some(_) => bail!("Codex model_provider must be a string"),
     };
-    if id == "aiguard" {
+    if id == "gptguard" {
         bail!("managed provider is already selected; restore the previous transaction first");
     }
 
@@ -208,18 +208,37 @@ fn validate_endpoint(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn is_calibration_model(model: &str) -> bool {
-    SUPPORTED_MODELS.contains(&model)
+/// Calibration is independent of the model catalog. Any new `gpt-*` model is
+/// calibrated by default; auxiliary models are forwarded without probes.
+pub fn is_calibration_model(config: &CodexConfig, model: &str) -> bool {
+    if config
+        .auxiliary_models
+        .iter()
+        .any(|entry| entry.eq_ignore_ascii_case(model))
+    {
+        return false;
+    }
+    if config
+        .auxiliary_prefixes
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+    {
+        return false;
+    }
+    if config
+        .calibration_prefixes
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+    {
+        return true;
+    }
+    config.models.iter().any(|entry| entry == model)
 }
 
 /// Auxiliary Codex models (auto-review, titles, etc.) are forwarded unchanged.
 /// Only syntax is checked so a model name cannot become a header/URL injection.
 pub fn valid_model_name(model: &str) -> bool {
-    !model.is_empty()
-        && model.len() <= 128
-        && model
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/' | b':'))
+    valid_model_id(model)
 }
 
 pub fn accepted_blocks(
@@ -227,20 +246,37 @@ pub fn accepted_blocks(
     baseline: usize,
     plan_hint: Option<&str>,
 ) -> (Vec<usize>, String) {
-    match mode {
-        AccountMode::Personal => (vec![10, 33], "manual".into()),
-        AccountMode::Team => (vec![12, 33], "manual".into()),
+    accepted_blocks_with_extra(mode, baseline, plan_hint, &[])
+}
+
+pub fn accepted_blocks_with_extra(
+    mode: &AccountMode,
+    baseline: usize,
+    plan_hint: Option<&str>,
+    extra: &[usize],
+) -> (Vec<usize>, String) {
+    let (mut blocks, source) = match mode {
+        AccountMode::Personal => (vec![10, 33], "manual".to_string()),
+        AccountMode::Team => (vec![12, 33], "manual".to_string()),
         AccountMode::Auto => {
             if baseline > 0 && baseline != 10 {
-                return (vec![baseline], "legacy_baseline".into());
-            }
-            match plan_hint {
-                Some("team") => (vec![12, 33], "token_hint".into()),
-                Some("personal") => (vec![10, 33], "token_hint".into()),
-                _ => (vec![10, 33], "default".into()),
+                (vec![baseline], "legacy_baseline".to_string())
+            } else {
+                match plan_hint {
+                    Some("team") => (vec![12, 33], "token_hint".to_string()),
+                    Some("personal") => (vec![10, 33], "token_hint".to_string()),
+                    _ => (vec![10, 33], "default".to_string()),
+                }
             }
         }
+    };
+    for value in extra {
+        if !blocks.contains(value) {
+            blocks.push(*value);
+        }
     }
+    blocks.sort_unstable();
+    (blocks, source)
 }
 
 pub fn plan_hint(authorization: Option<&str>, account_header: Option<&str>) -> Option<String> {
@@ -377,7 +413,11 @@ requires_openai_auth = true
         assert!(valid_model_name("codex-auto-review"));
         assert!(!valid_model_name("bad model"));
         assert!(!valid_model_name("bad\nmodel"));
-        assert!(!is_calibration_model("codex-auto-review"));
-        assert!(is_calibration_model("gpt-6-astra"));
+        let config = CodexConfig::default();
+        assert!(!is_calibration_model(&config, "codex-auto-review"));
+        assert!(is_calibration_model(&config, "gpt-6-astra"));
+        assert!(is_calibration_model(&config, "gpt-6.1-sol"));
+        assert!(is_calibration_model(&config, "gpt-6.2-astra"));
+        assert!(is_calibration_model(&config, "gpt-7-future"));
     }
 }

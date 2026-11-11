@@ -195,7 +195,7 @@ pub fn takeover(
 
 fn render_managed_config(config: &Config, original: &str, selection: &Selection) -> Result<String> {
     let mut doc: DocumentMut = original.parse().context("parse Codex TOML")?;
-    doc["model_provider"] = value("aiguard");
+    doc["model_provider"] = value("gptguard");
     if config.codex.fixed_model {
         doc["model"] = value(&config.codex.model);
     }
@@ -206,9 +206,9 @@ fn render_managed_config(config: &Config, original: &str, selection: &Selection)
     let providers = providers
         .as_table_mut()
         .context("model_providers must be a table")?;
-    providers.remove("aiguard");
+    providers.remove("gptguard");
     let mut managed = Table::new();
-    managed["name"] = value("ChatGPTGuard");
+    managed["name"] = value("GPTGuard");
     managed["base_url"] = value(format!(
         "http://127.0.0.1:{}/backend-api/codex",
         listen_port(&config.codex.listen)
@@ -223,7 +223,7 @@ fn render_managed_config(config: &Config, original: &str, selection: &Selection)
                 .unwrap_or_else(|| "OPENAI_API_KEY".into()),
         );
     }
-    providers["aiguard"] = Item::Table(managed);
+    providers["gptguard"] = Item::Table(managed);
 
     if let Some(profile) = &selection.profile {
         if let Some(profile_table) = doc
@@ -232,7 +232,7 @@ fn render_managed_config(config: &Config, original: &str, selection: &Selection)
             .and_then(|profiles| profiles.get_mut(profile))
             .and_then(|item| item.as_table_mut())
         {
-            profile_table["model_provider"] = value("aiguard");
+            profile_table["model_provider"] = value("gptguard");
             if config.codex.fixed_model {
                 profile_table["model"] = value(&config.codex.model);
             }
@@ -339,7 +339,7 @@ mod tests {
             state_file: root.join("data/state.json"),
             log_dir: root.join("data/logs"),
             backups_dir: root.join("data/backups"),
-            lock_file: root.join("data/aiguard.lock"),
+            lock_file: root.join("data/gptguard.lock"),
         }
     }
 
@@ -368,7 +368,7 @@ requires_openai_auth = true
         let info = takeover(&config, &paths, None, "chatgpt").unwrap();
         assert!(info.selection.official);
         let installed = fs::read_to_string(codex.join("config.toml")).unwrap();
-        assert!(installed.contains("model_provider = \"aiguard\""));
+        assert!(installed.contains("model_provider = \"gptguard\""));
         assert!(installed.contains("# my config"));
         assert!(installed.contains("model = \"gpt-6-astra\""));
         assert!(installed.contains("http://127.0.0.1:17841/backend-api/codex"));

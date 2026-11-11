@@ -52,7 +52,7 @@ pub fn build_client(proxy: Option<&str>) -> Result<reqwest::Client> {
         .timeout(Duration::from_secs(30 * 60))
         .connect_timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("AIGuard/", env!("CARGO_PKG_VERSION")));
+        .user_agent(concat!("GPTGuard/", env!("CARGO_PKG_VERSION")));
     match proxy {
         Some(proxy) => {
             builder = builder.proxy(reqwest::Proxy::all(proxy).context("invalid proxy URL")?);
