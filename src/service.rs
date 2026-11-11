@@ -112,6 +112,17 @@ pub async fn run(config: Config, paths: AppPaths, open_panel: bool) -> Result<()
 
     let cfg = config.clone();
     let proxy = ProxyRuntime::new(cfg.clone(), paths.clone())?;
+    if !cfg.protection.enabled && cfg.protection.network_guard {
+        // A previous daemon may have been force-killed while blocked. Clear
+        // AIGuard's own hosts/firewall entries on a clean disabled start.
+        let report = guard::enforce(&cfg, false);
+        if !report.errors.is_empty() {
+            util::warn(format!(
+                "startup cleanup could not remove network block: {}",
+                report.errors.join("; ")
+            ));
+        }
+    }
     let started_at = util::now_iso();
     let panel_url = format!("http://127.0.0.1:{}", cfg.ui.web_port);
     let runtime = RuntimeState {
