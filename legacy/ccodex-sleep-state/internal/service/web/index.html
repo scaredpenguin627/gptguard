@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Sleep State · 本地管理</title>
+    <link rel="stylesheet" href="/admin/style.css" />
+    <script src="/admin/app.js" defer></script>
+    <script src="/admin/upgrade.js" defer></script>
+    <script src="/admin/environment_check.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <span class="mark">S</span>
+        <div>
+          <strong>Sleep State</strong><small>Codex 的本地连接管理</small>
+        </div>
+      </div>
+      <span class="local">仅本机可访问</span
+      ><button id="logout" class="quiet" hidden>退出面板</button>
+    </header>
+    <section id="login" class="login">
+      <p class="eyebrow">先连接你的服务</p>
+      <h1>配置不用再靠猜。</h1>
+      <p>
+        从启动服务的终端复制「管理口令」。它和你的 Codex
+        登录、订阅密码不是一回事。
+      </p>
+      <form id="login-form">
+        <label for="token">管理口令</label
+        ><input id="token" type="password" autocomplete="off" required /><button
+          type="submit"
+        >
+          进入管理面板
+        </button>
+      </form>
+      <p class="hint">服务重启后口令会更换。不要把口令截图发到群里。</p>
+    </section>
+    <div id="workspace" hidden>
+      <nav aria-label="管理页面">
+        <button data-page="overview" class="active">开始使用</button
+        ><button data-page="configuration">连接设置</button
+        ><button data-page="sources">订阅与代理</button
+        ><button data-page="routes">路由</button
+        ><button data-page="pool">代理池</button><button data-page="help">遇到问题</button>
+      </nav>
+      <main>
+        <section data-view="overview">
+          <p class="eyebrow">运行状态</p>
+          <div class="quick-start"><div><strong id="next-step-title">先连接服务</strong><p id="next-step-help">读取状态后会告诉你下一步。</p></div><button id="next-step-action">去处理</button></div>
+          <h1 id="headline">正在读取状态…</h1>
+          <p class="lead">
+            先让 Codex 接上，再决定要不要注入。配置和故障都留在这个窗口处理。
+          </p>
+          <div class="quick-start">
+            <div>
+              <strong>不想研究设置？从这里开始。</strong>
+              <p>
+                沿用当前账号，自动备份配置，检查常见本地代理。采不到 state
+                时先正常转发。
+              </p>
+            </div>
+            <button id="quick-setup">一键接入 Codex</button>
+          </div>
+          <div class="onboarding" aria-label="接入进度">
+            <button class="step" data-jump="configuration">
+              <span class="step-number">1</span
+              ><span
+                ><strong>接入 Codex</strong
+                ><small id="step-config">检查当前配置</small></span
+              >
+            </button>
+            <button class="step" data-jump="sources">
+              <span class="step-number">2</span
+              ><span
+                ><strong>选择连接</strong
+                ><small id="step-route">直连、代理或订阅</small></span
+              >
+            </button>
+            <button class="step" data-jump="overview">
+              <span class="step-number">3</span
+              ><span
+                ><strong>发条消息</strong
+                ><small id="step-request">重启 Codex，再试一次</small></span
+              >
+            </button>
+          </div>
+          <div id="warnings"></div>
+          <section class="card">
+            <div class="row"><div><h2>不确定哪里没配好？先检查一下。</h2><p>只检查本地，不改配置、不读取登录凭据，也不发送模型请求。</p></div><button id="environment-check">一键检测环境配置</button></div>
+            <div id="environment-results" aria-live="polite" hidden></div>
+          </section>
+          <section id="rescue-card" class="card" hidden>
+            <h2>服务配置损坏，但不用手改 JSON</h2>
+            <p>
+              现在运行的是只读修复面板。旧配置没有被加载，也没有接管
+              Codex。点击后先看说明，再确认是否备份并重建。
+            </p>
+            <button id="reset-service-config">检查并重建服务配置</button>
+          </section>
+          <div class="stats">
+            <div><span>当前模式</span><strong id="mode">—</strong></div>
+            <div><span>可用出口</span><strong id="route-count">—</strong></div>
+            <div><span>Codex 配置</span><strong id="managed">—</strong></div>
+          </div>
+          <section class="card">
+            <div class="row">
+              <div>
+                <h2>turn-state 注入</h2>
+                <p id="injection-help">
+                  开启时只使用符合规则的
+                  state。关闭后仍走本服务和所选出口，但不再采集、替换 state。
+                </p>
+              </div>
+              <button id="toggle">读取中…</button>
+            </div>
+            <p class="hint">
+              关闭注入不是绕过官方限流。401、403、429
+              的停止规则仍然生效；正在进行的回复不会被打断。
+            </p>
+          </section>
+          <section class="card">
+            <h2>拿到可用值后，固定用还是备一份？</h2>
+            <p>固定主用更少探测；主备模式提前准备下一份。两者都遵守到期和上游限流。</p>
+            <select id="state-policy"><option value="on_demand">拿到后固定使用 · 少探测</option><option value="standby">提前备好下一份 · 主用＋备用</option></select>
+            <button id="save-state-policy">就用这个方式（保留当前可用值）</button>
+            <p id="state-policy-result" role="status"></p>
+          </section>
+          <section class="card">
+            <h2>请求与会话</h2>
+            <p id="traffic-summary" class="hint"></p>
+            <div id="recent-requests" class="stack"></div>
+            <div id="sessions" class="stack"></div>
+          </section>
+        </section>
+        <section data-view="configuration" hidden>
+          <p class="eyebrow">连接设置</p>
+          <h1>只管你这一次要用的连接。</h1>
+          <p class="lead">
+            普通设置直接保存。出现旧版本或 CCS
+            冲突时，先检查再修复；不用手动删文件。
+          </p>
+          <section class="card">
+            <h2>模型与账号规则</h2>
+            <form id="preferences-form">
+              <div class="settings-grid">
+                <div>
+                  <label for="model-select">默认模型</label
+                  ><select id="model-select">
+                    <option value="gpt-6-astra">Astra</option>
+                    <option value="gpt-5.6-sol">5.6 Sol</option>
+                    <option value="gpt-5.6-terra">5.6 Terra</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="account-select">账号规则</label
+                  ><select id="account-select">
+                    <option value="auto">自动识别（不确定时提示）</option>
+                    <option value="personal">个人 · 292 / 10 块</option>
+                    <option value="team">Team · 332 / 12 块</option>
+                  </select>
+                </div>
+              </div>
+              <p class="hint">
+                Team 不再按个人账号的 292 筛选。312、356
+                不会冒充合格结果。长度只是实验规则，不是模型智力检测；可用模型仍以你的上游权限为准。
+              </p>
+              <label for="fallback-select">暂时采不到合格 state 时</label
+              ><select id="fallback-select">
+                <option value="strict">
+                  严格等待 · 不转发正式请求，返回本地 503
+                </option>
+                <option value="passthrough">
+                  先正常使用 · 不注入，原请求只转发一次
+                </option>
+              </select>
+              <p class="hint">
+                “先正常使用”不是采集成功，也不保证改善降智。401、403、429
+                仍暂停；已经发给上游的请求不会自动重发。
+              </p>
+              <button type="submit" class="secondary">保存模型与规则</button>
+            </form>
+          </section>
+          <section class="card">
+            <h2>采集时间与次数</h2>
+            <p>不确定就用默认值。这里控制本地采集，不改变套餐额度、官方限流或上游 state 的真实寿命。关闭注入或使用中转时，这些设置不触发采集。</p>
+            <form id="timing-form">
+              <div class="settings-grid">
+                <div><label for="probe-timeout">单次探测超时（秒）</label><input id="probe-timeout" type="number" min="1" max="60" step="1" required /><small>1–60 秒；不是正常回复的超时。</small></div>
+                <div><label for="probe-cooldown">两轮采集最短间隔（秒）</label><input id="probe-cooldown" type="number" min="30" max="3600" step="1" required /><small>30–3600 秒；上游要求等待更久时，以更久为准。</small></div>
+                <div><label for="state-ttl">本地 state 有效期（秒）</label><input id="state-ttl" type="number" min="120" max="3600" step="1" required /><small>120–3600 秒，从 state 签发时间计算；最后 30 秒不再接纳新请求。</small></div>
+                <div><label for="refresh-before">到期前多久刷新（秒）</label><input id="refresh-before" type="number" min="30" max="3599" step="1" required /><small>至少 30 秒，必须小于有效期；不是每隔这么久刷新。</small></div>
+                <div><label for="max-probes">每轮最多探测次数</label><input id="max-probes" type="number" min="1" max="20" step="1" required /><small>1–20 次；每次模型探测可能消耗额度。</small></div>
+              </div>
+              <p id="timing-summary" class="hint" aria-live="polite"></p>
+              <div class="actions">
+                <button type="button" id="timing-defaults" class="secondary">填入默认值</button>
+                <button type="button" id="timing-low-frequency" class="secondary">低频采集预设</button>
+                <button type="button" id="timing-cancel" class="quiet">撤销未保存修改</button>
+                <button type="submit">保存采集设置</button>
+              </div>
+              <p class="hint">预设只填表，不自动保存。保存前会确认，成功后无需重启；现有 state 缓存会清空，后续请求可能重新采集。上游拒绝或限流期间不允许重建采集器。</p>
+              <p id="timing-result" class="result" role="status"></p>
+            </form>
+          </section>
+          <details class="card" id="advanced-details"><summary>高级设置（通常不用改）</summary>
+            <h2>请求上限与实际出口</h2>
+            <form id="advanced-form">
+              <div class="settings-grid">
+                <div><label for="request-limit">请求体上限（MiB）</label><input id="request-limit" type="number" min="16" max="128" required /></div>
+                <div><label for="window-limit">zstd 窗口上限（MiB）</label><input id="window-limit" type="number" min="16" max="128" required /></div>
+                <div><label for="compact-limit">压缩回复上限（MiB）</label><input id="compact-limit" type="number" min="16" max="128" required /></div>
+              </div>
+              <p class="hint">默认 64 MiB，最高 128 MiB。解决本地 413，不会提高上游限制。越大越占内存；最多 4 个大请求同时处理，其余等待。</p>
+              <label for="egress-mode">正常请求的出口</label>
+              <select id="egress-mode"><option value="state">兼容模式 · 使用采集 state 的节点</option><option value="random">独立随机 · 从可用池选择另一个节点</option><option value="fixed">用户固定 · 使用下面选定的节点</option></select>
+              <label for="egress-route">固定节点（先读取代理池）</label><select id="egress-route"><option value="">请先读取</option></select>
+              <button type="button" id="load-egress" class="secondary">读取节点，不探测</button>
+              <p class="hint">“自定义 IP”是选择你有权使用的代理端点，不是任意伪造公网 IP。采集节点与转发节点不同，不保证底层公网 IP 不同；节点名也不证明国家或家宽。跨出口使用 state 属实验功能。</p>
+              <label><input id="pool-enabled" type="checkbox" /> 用过的节点移入已用/失败清单，不自动循环复用</label>
+              <label><input id="external-only" type="checkbox" /> 外部代理模式：只接入用户自己的 HTTP/SOCKS5 端点</label>
+              <p class="hint">外部代理模式会拒绝内嵌隧道协议节点；它不改变你使用网络的合规义务。开启前先在代理客户端加载订阅。</p>
+              <button type="button" id="pool-preset" class="secondary">填入独立随机＋用后移出</button>
+              <button type="submit">备份并保存高级设置</button>
+              <p id="advanced-result" role="status"></p>
+            </form>
+          </details>
+          <section class="card">
+            <h2>中转站连接助手</h2>
+            <p>支持 Responses 兼容接口；只列出 Astra / Sol / Terra。中转按自己的 API key 转发，不强制采集 292，也不会凭 332 推断 Team 身份。</p>
+            <form id="relay-models-form">
+              <label for="relay-base">基础地址 / Responses 地址</label><input id="relay-base" type="password" autocomplete="off" placeholder="https://中转地址/v1" required />
+              <label for="relay-key">该中转的 API key（仅本次检测，不保存）</label><input id="relay-key" type="password" autocomplete="off" />
+              <button type="submit">读取可用模型，不生成内容</button>
+              <button type="button" id="repair-relay" class="secondary">只补全缺失的 base_url</button>
+              <p id="relay-result" role="status"></p>
+            </form>
+            <p class="hint">读模型只调用 /models；出现 404 可能是中转不支持该接口，不代表生成必定不可用。补全地址会保留其它配置并备份；已有地址或无法安全定位时拒绝覆盖。Key 仍需在 Codex/CCS 配好。</p>
+          </section>
+          <section class="card">
+            <h2>CCS / CC Switch 与中转站</h2>
+            <p>
+              自动接管会检查当前选中的 Codex
+              provider。官方走官方认证，中转走自己的 API
+              key；不会把官方登录凭据拿去试中转站。
+            </p>
+            <p>
+              注释和无关设置的改动不再导致整份配置报错。若 CCS
+              切换了上游或认证，服务会暂停转发，避免把凭据发错地方。点下面的检查按钮，保留当前选择后重新接管即可。
+            </p>
+            <div class="actions">
+              <button id="recover" class="secondary">重新检查并接管</button
+              ><button id="inspect-recovery" class="secondary">
+                检查与修复配置
+              </button>
+            </div>
+            <div id="recovery-panel" hidden>
+              <p id="recovery-summary" class="result"></p>
+              <div class="actions">
+                <button id="keep-current">保留当前配置并重新接管</button
+                ><button id="restore-backup" class="secondary">
+                  恢复接管前备份
+                </button>
+              </div>
+              <p class="hint">
+                两种操作都会先备份当前配置和恢复记录。恢复旧备份会撤销之后的修改；不确定就选保留当前配置。
+              </p>
+            </div>
+            <p class="hint">
+              只读模式（--no-config）不会写入 Codex 配置；仍可保存本工具的采集和代理设置。需要接管 Codex 时，退出后用 setup
+              启动。切换完成后重启 Codex，让新会话使用新配置。
+            </p>
+          </section>
+          <details class="card">
+            <summary>配置已经很乱，重新配置连接</summary>
+            <p class="hint">
+              最后手段，不是常规操作。会完整备份旧
+              config.toml，再生成最小连接配置。原插件、MCP
+              和个性化设置不会搬进新文件；可以从备份恢复。已有旧接管记录时，先用上面的配置修复。
+            </p>
+            <form id="rebuild-form">
+              <label for="rebuild-kind">这次明确要用哪种账号？</label
+              ><select id="rebuild-kind">
+                <option value="official">官方 ChatGPT 登录</option>
+                <option value="relay">API key / 中转站</option>
+              </select>
+              <div id="rebuild-relay" hidden>
+                <label for="rebuild-url">Responses API 基础地址</label
+                ><input
+                  id="rebuild-url"
+                  type="password"
+                  autocomplete="off"
+                  placeholder="https://你的中转站/v1"
+                /><label for="rebuild-env"
+                  >已有 API key 的环境变量名（可选）</label
+                ><input
+                  id="rebuild-env"
+                  autocomplete="off"
+                  placeholder="OPENAI_API_KEY（变量名，不是密钥）"
+                />
+                <p class="hint">
+                  留空时只使用 Codex / CCS 已配置的 API
+                  key。这里不会读取或上传你的密钥。
+                </p>
+              </div>
+              <button type="submit" class="secondary">
+                备份并重建连接配置
+              </button>
+            </form>
+          </details>
+        </section>
+        <section data-view="sources" hidden>
+          <p class="eyebrow">订阅与代理</p>
+          <h1>有代理软件就填地址，有链接就导入。</h1>
+          <p class="lead">
+            本地已经开着 Clash 一类工具，就填它的 HTTP 或 SOCKS5
+            地址。没有，也可以直接导入订阅。
+          </p>
+          <form id="source-form" class="card">
+            <label for="source-mode">连接方式</label
+            ><select id="source-mode">
+              <option value="proxy">本地 / HTTP / SOCKS5 代理</option>
+              <option value="subscription">
+                订阅链接（支持本地 HTTP 订阅）
+              </option>
+              <option value="file">本地订阅文件</option>
+              <option value="direct">直连，不使用代理</option>
+            </select>
+            <div id="source-value-wrap">
+              <label id="source-label" for="source-value">代理地址</label
+              ><input
+                id="source-value"
+                type="password"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="socks5://127.0.0.1:7897"
+              />
+              <p id="source-hint" class="hint">
+                端口以你的代理软件为准。此处填写的是地址，不是 PowerShell 命令。
+              </p>
+            </div>
+            <div id="subscription-options" hidden>
+              <label for="user-agent">订阅客户端标识（可选）</label
+              ><input id="user-agent" placeholder="留空使用程序默认值" />
+              <p class="hint">
+                有些订阅会按客户端返回不同内容。只有订阅提供方要求时再填写，不会伪装模型版本。
+              </p>
+              <label for="exclude">排除节点名称 / 地址关键词（逗号分隔）</label
+              ><input
+                id="exclude"
+                placeholder="香港, 台湾, 澳门, Hong Kong, Taiwan, Macau"
+              /><label for="protocols">只保留这些协议（可选，逗号分隔）</label
+              ><input id="protocols" placeholder="例如 anytls, trojan" />
+              <p class="hint">
+                按订阅标签筛选，不是出口地理位置验证。需要跳过证书校验的节点不会被接受。
+              </p>
+            </div>
+            <div class="actions">
+              <button type="button" id="test-source" class="secondary">
+                先测试能否读取</button
+              ><button type="submit">保存并应用</button>
+            </div>
+            <p class="hint">
+              保存会替换本服务现有出口来源，并留下配置备份；不会修改你的代理软件、系统代理或订阅原文件。
+            </p>
+          </form>
+          <div id="source-result" class="result" hidden></div>
+          <section class="card">
+            <h2>多个订阅合成一个代理池</h2>
+            <p>可手动输入或粘贴订阅链接，每行一个；也可导入 TXT（UTF-8，最多 64 KiB）。最多 16 个来源、合并后最多 256 个节点；相同节点配置去重。任一来源失败时保留旧配置，不悄悄丢掉原池。</p>
+            <form id="pool-import-form">
+              <input id="subscription-txt" type="file" accept=".txt,text/plain" />
+              <label for="subscription-lines">手动输入／粘贴订阅链接（一行一个，含凭据请勿截图）</label><textarea id="subscription-lines" rows="5" required spellcheck="false"></textarea>
+              <label><input id="subscription-append" type="checkbox" checked /> 追加到现有来源（不勾选则替换）</label>
+              <label><input id="subscription-enable-pool" type="checkbox" checked /> 导入后启用随机出口＋用后移出（追加时保留已选固定出口）</label>
+              <p class="hint">随机独立出口配合注入至少需要两个节点；已用/失败的不会自动回池。只想导入、不改变当前策略，请取消这个勾选。</p>
+              <button type="button" id="test-pool-import" class="secondary">先检查所有订阅</button><button type="submit">备份并导入代理池</button>
+              <p id="pool-import-result" role="status"></p>
+            </form>
+            <p class="hint">仅导入你有权使用的来源。项目不提供订阅、节点、跨境线路或代购服务，不修改系统代理/TUN。节点不是经过验证的唯一公网 IP。</p>
+          </section>
+        </section>
+        <section data-view="routes" hidden>
+          <p class="eyebrow">路由</p>
+          <h1>知道请求往哪走。</h1>
+          <p class="lead">
+            这里是旧版兼容路由操作；独立随机出口、固定实际出口和节点回收请使用「连接设置」与「代理池」。旧版固定会同时限制采集和转发。
+          </p>
+          <div class="actions">
+            <button id="load-routes">读取路由列表</button
+            ><button id="auto-route" class="secondary">恢复自动选择</button>
+          </div>
+          <p class="hint">
+            读取列表会重新获取订阅，但不调用模型。连接测试不带登录信息，也不消耗模型生成额度。
+          </p>
+          <div id="routes-list" class="stack"></div>
+          <div id="route-result" class="result" hidden></div>
+        </section>
+        <section data-view="pool" hidden>
+          <p class="eyebrow">节点生命周期</p><h1>可用、已用、失败，分开管理。</h1>
+          <p>记录按节点配置标识，不按国家名或公网 IP。已用/失败节点不会自动回池；重新导入相同节点仍保留记录。清理是停用，可再次手动放回，不修改订阅地址。</p>
+          <button id="reload-pool">刷新本地代理池</button>
+          <label for="pool-filter">查看清单</label><select id="pool-filter"><option value="available">可用池</option><option value="used">已用清单</option><option value="failed">失败清单</option><option value="disabled">已清理（停用）</option></select>
+          <label for="pool-session">单节点采集使用的现有会话</label><select id="pool-session"><option value="">先在 Codex 发一条消息，再刷新</option></select>
+          <p class="hint">单节点重试只探测选中节点一次，失败后可在冷却结束再点。不读取登录文件、不跳过 401/403/429、不自动重放正式请求。主用仍可用时，成功的新值可作为备用。</p>
+          <div class="actions"><button id="pool-select-all" class="secondary">全选当前清单</button><button id="pool-recycle" class="secondary">选中项放回可用池</button><button id="pool-disable" class="secondary">清理选中项</button></div>
+          <p id="pool-summary" class="hint"></p><div id="pool-list" class="stack"></div><p id="pool-result" role="status"></p>
+        </section>
+        <section data-view="help" hidden>
+          <p class="eyebrow">遇到问题</p>
+          <h1>先看是哪一层没通。</h1>
+          <div class="card">
+            <h2>发给群友或 AI 的排查结果</h2>
+            <p>
+              只导出请求次数、状态码和配置状态，不导出密钥、订阅、对话、配置路径或
+              state。
+            </p>
+            <button id="download-diagnostics" class="secondary">
+              下载脱敏诊断
+            </button>
+          </div>
+          <div class="card prose">
+            <h2>本地 503：还没有合格 state</h2>
+            <p>
+              如果错误代码是
+              state_unavailable，说明服务没有拿到符合当前规则的票，不等于官方挂了。先看出口能否连接，再看会话状态。需要先正常用
+              Codex 时，可以主动关闭注入；程序不会偷偷帮你切换。
+            </p>
+            <h2>上游 503 / 502 / 超时</h2>
+            <p>
+              出口连接失败和上游拒绝不是同一回事。先测试你正在使用的出口，确认代理进程和端口。不要连点重试：真实请求可能已经执行，程序不会自动重发一次生成来赌成功。
+            </p>
+            <h2>unfinished config transaction</h2>
+            <p>
+              常见于直接关闭终端或系统异常退出。新版本会先核对文件：没被改动的旧接管配置可以安全恢复，再重新接管；如果
+              CCS 或你自己改过，保留备份和恢复记录，不覆盖新内容。
+            </p>
+            <h2>有代理地址，为什么还是直连？</h2>
+            <p>
+              旧版仅设置 CCODEX_PROXY
+              环境变量还不够，配置也要引用它。现在直接在「订阅与代理」选择代理、填地址并保存。当前服务不需要知道你以前在哪个终端设置过变量。
+            </p>
+            <h2>中转站为什么不能开启注入？</h2>
+            <p>
+              普通 Responses 中转未必提供官方
+              turn-state。此版本对中转采用不注入转发；不会拿官方账号去给中转打票，也不把一个
+              HTTP 200 宣称成改善了降智。
+            </p>
+            <h2>401 / 403 / 429</h2>
+            <p>
+              账号登录、访问权限或额度需要在 Codex /
+              服务提供方处理。管理面板不会用换出口来绕过这些限制。不要把
+              auth.json、订阅链接或完整日志发到群里。
+            </p>
+          </div>
+        </section>
+      </main>
+    </div>
+    <div id="notice" role="status" aria-live="polite" hidden></div>
+    <footer>
+      Astra · Sol · Terra。尝试改善使用体验，不保证消除降智或限流。
+    </footer>
+  </body>
+</html>

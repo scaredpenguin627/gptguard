@@ -1,0 +1,26 @@
+name: CI
+on:
+  push:
+    branches: ['**']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - name: Vet
+        run: go vet ./...
+      - name: Test with race detection
+        run: go test -race -count=1 ./...
+      - name: Build
+        run: go build -trimpath ./cmd/ccodex-sleep-state
