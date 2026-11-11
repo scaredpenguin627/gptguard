@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChatGPTGuard · AIGuard</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0e1420;
+    --panel: #151e2d;
+    --line: #253247;
+    --text: #e7edf7;
+    --muted: #93a4bd;
+    --green: #39b97b;
+    --red: #e06464;
+    --yellow: #e9ad48;
+    --blue: #6aa8ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: radial-gradient(1200px 600px at 20% -10%, #1b2b45 0%, var(--bg) 55%);
+    color: var(--text);
+    font: 14px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  main { max-width: 1120px; margin: 0 auto; padding: 28px 20px 60px; }
+  header { display: flex; gap: 16px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: .5px; }
+  h1 span { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 8px; }
+  .pill { padding: 6px 14px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); font-weight: 600; }
+  .pill.allowed { color: var(--green); border-color: #1f5c42; }
+  .pill.blocked, .pill.error { color: var(--red); border-color: #663434; }
+  .pill.offline, .pill.waiting { color: var(--yellow); border-color: #6a5524; }
+  .pill.disabled, .pill.stopped { color: var(--muted); }
+  .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; margin-top: 18px; }
+  .card { background: color-mix(in srgb, var(--panel) 92%, transparent); border: 1px solid var(--line); border-radius: 14px; padding: 16px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin: 0 0 12px; }
+  .col-4 { grid-column: span 4; } .col-6 { grid-column: span 6; } .col-8 { grid-column: span 8; } .col-12 { grid-column: span 12; }
+  @media (max-width: 860px) { .col-4, .col-6, .col-8 { grid-column: span 12; } }
+  .kv { display: grid; grid-template-columns: 110px 1fr; gap: 6px 10px; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0; word-break: break-all; }
+  .ok { color: var(--green); } .bad { color: var(--red); } .warn { color: var(--yellow); }
+  button {
+    border: 1px solid var(--line); background: #1d2a3e; color: var(--text);
+    border-radius: 9px; padding: 8px 13px; cursor: pointer; font: inherit;
+  }
+  button:hover { border-color: #3d5577; }
+  button.primary { background: #1f5c42; border-color: #2a7a58; }
+  button.danger { background: #5a2626; border-color: #7a3232; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  textarea, input, select {
+    width: 100%; background: #0f1724; color: var(--text); border: 1px solid var(--line);
+    border-radius: 9px; padding: 9px 10px; font: inherit;
+  }
+  textarea { min-height: 92px; resize: vertical; font-family: Consolas, monospace; }
+  label { color: var(--muted); font-size: 12px; display: block; margin: 10px 0 4px; }
+  pre { background: #0b111b; border: 1px solid var(--line); border-radius: 10px; padding: 12px; overflow: auto; max-height: 260px; white-space: pre-wrap; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .toast { position: fixed; right: 20px; bottom: 20px; background: #1d2a3e; border: 1px solid var(--line); padding: 10px 14px; border-radius: 10px; display: none; max-width: 480px; }
+  .toast.show { display: block; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--muted); margin-right: 6px; }
+  .dot.ok { background: var(--green); } .dot.bad { background: var(--red); } .dot.warn { background: var(--yellow); }
+  code { color: #b9d4ff; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>🛡️ ChatGPTGuard <span>AIGuard · 本地出口守卫与 Codex 转发</span></h1>
+    <div class="row">
+      <span id="statusPill" class="pill stopped">读取中</span>
+      <button id="checkBtn" class="primary">立即检测</button>
+    </div>
+  </header>
+
+  <div class="grid">
+    <section class="card col-4">
+      <h2>出口状态</h2>
+      <dl class="kv">
+        <dt>判定</dt><dd id="verdict">-</dd>
+        <dt>HTTP 出口</dt><dd id="httpIp">-</dd>
+        <dt>STUN 出口</dt><dd id="stunIp">-</dd>
+        <dt>最近检测</dt><dd id="checkedAt">-</dd>
+        <dt>说明</dt><dd id="detail">-</dd>
+      </dl>
+    </section>
+
+    <section class="card col-4">
+      <h2>Codex 转发</h2>
+      <dl class="kv">
+        <dt>监听</dt><dd id="codexListen">-</dd>
+        <dt>上游</dt><dd id="codexUpstream">-</dd>
+        <dt>接管</dt><dd id="codexOwned">-</dd>
+        <dt>配置一致</dt><dd id="codexMatch">-</dd>
+        <dt>出口数</dt><dd id="codexRoutes">-</dd>
+        <dt>模型</dt><dd id="codexModel">-</dd>
+      </dl>
+    </section>
+
+    <section class="card col-4">
+      <h2>执行层</h2>
+      <dl class="kv">
+        <dt>管理员</dt><dd id="elevated">-</dd>
+        <dt>hosts 阻断</dt><dd id="hostsBlocked">-</dd>
+        <dt>防火墙</dt><dd id="firewallBlocked">-</dd>
+        <dt>更新锁</dt><dd id="updateLocked">-</dd>
+        <dt>已终止进程</dt><dd id="killed">-</dd>
+      </dl>
+    </section>
+
+    <section class="card col-6">
+      <h2>出口白名单与防护</h2>
+      <label for="whitelist">IP / CIDR，每行一条</label>
+      <textarea id="whitelist" placeholder="203.0.113.10&#10;198.51.100.0/24"></textarea>
+      <div class="row" style="margin-top:10px">
+        <button id="saveWhitelist" class="primary">保存白名单</button>
+        <button id="toggleProtection">开启 / 关闭防护</button>
+        <span id="protectionState" class="hint"></span>
+      </div>
+      <p class="hint">检测方式与代理在配置文件中设置；空白名单按失败处理。网络层阻断需要管理员权限。</p>
+    </section>
+
+    <section class="card col-6">
+      <h2>Codex 接管与采集</h2>
+      <div class="row">
+        <select id="authMode" style="max-width:190px">
+          <option value="unknown">自动识别认证</option>
+          <option value="chatgpt">ChatGPT 登录</option>
+          <option value="api_key">API key</option>
+        </select>
+        <button id="takeover" class="primary">接管 Codex 配置</button>
+        <button id="restore">恢复原配置</button>
+        <button id="probe">测试采集</button>
+      </div>
+      <label for="subscription">订阅 / 代理列表 URL</label>
+      <div class="row">
+        <input id="subscription" placeholder="https://example.com/sub" style="flex:1;min-width:220px">
+        <button id="importSub">导入</button>
+      </div>
+      <p class="hint">接管会先备份 <code>~/.codex/config.toml</code>；采集会用真实请求消耗额度，且不保证得到 state。</p>
+    </section>
+
+    <section class="card col-6">
+      <h2>Windows 更新锁与自启动</h2>
+      <div class="row">
+        <button id="toggleUpdate">开启 / 关闭自动更新锁定</button>
+        <button id="toggleAutostart">开启 / 关闭登录自启动</button>
+      </div>
+      <p class="hint">更新锁会写 hosts 并给更新目录加拒绝写入 ACL，需要管理员权限；关闭后恢复。</p>
+      <dl class="kv" style="margin-top:12px">
+        <dt>自启动</dt><dd id="autostart">-</dd>
+        <dt>更新目录</dt><dd id="updatePaths">-</dd>
+      </dl>
+    </section>
+
+    <section class="card col-6">
+      <h2>诊断</h2>
+      <div id="doctor" class="kv"></div>
+    </section>
+
+    <section class="card col-12">
+      <h2>日志（最近 250 行）</h2>
+      <pre id="log">加载中…</pre>
+      <div class="row"><button id="refreshLog">刷新日志</button></div>
+    </section>
+  </div>
+</main>
+<div id="toast" class="toast"></div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  let token = (() => {
+    const match = location.hash.match(/token=([^&]+)/);
+    if (match) {
+      sessionStorage.setItem('aiguard_token', decodeURIComponent(match[1]));
+      history.replaceState(null, '', location.pathname);
+      return decodeURIComponent(match[1]);
+    }
+    return sessionStorage.getItem('aiguard_token') || '';
+  })();
+  if (!token) token = prompt('请输入管理口令（启动输出中的 #token=）') || '';
+  if (token) sessionStorage.setItem('aiguard_token', token);
+
+  const toast = (message) => {
+    const box = $('toast');
+    box.textContent = message;
+    box.classList.add('show');
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(() => box.classList.remove('show'), 4200);
+  };
+
+  async function api(path, body) {
+    const response = await fetch(path, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: { 'x-aiguard-token': token, 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.error?.message || `HTTP ${response.status}`);
+    }
+    return data;
+  }
+
+  const set = (id, value, cls) => {
+    const node = $(id);
+    node.textContent = value ?? '-';
+    if (cls) node.className = cls;
+  };
+  const bool = (value) => value ? '是' : '否';
+  const cls = (value) => value ? 'ok' : 'bad';
+
+  function render(data) {
+    const runtime = data.runtime || {};
+    const cfg = data.config || {};
+    const proxy = data.proxy || {};
+    const verdict = runtime.status || 'stopped';
+    const labels = { allowed: '允许 · 出口已通过', blocked: '已阻断 · 出口不在白名单', offline: '无法确认出口', disabled: '防护关闭', error: '执行层异常', stopped: '未运行' };
+    const pill = $('statusPill');
+    pill.textContent = labels[verdict] || verdict;
+    pill.className = 'pill ' + verdict;
+    set('verdict', labels[verdict] || verdict, verdict === 'allowed' ? 'ok' : (verdict === 'blocked' || verdict === 'error') ? 'bad' : 'warn');
+    set('httpIp', runtime.http_ip || '-');
+    set('stunIp', runtime.stun_ip || '-');
+    set('checkedAt', runtime.checked_at || '-');
+    set('detail', runtime.detail || '-');
+    set('codexListen', proxy.listen || '-');
+    set('codexUpstream', proxy.upstream || '-');
+    set('codexOwned', bool(proxy.owned));
+    set('codexMatch', bool(proxy.config_matches), cls(proxy.config_matches));
+    set('codexRoutes', proxy.routes ?? '-');
+    set('codexModel', cfg.codex?.model || '-');
+    const enforcement = runtime.enforcement || {};
+    set('elevated', bool(enforcement.elevated), cls(enforcement.elevated));
+    set('hostsBlocked', bool(enforcement.hosts_blocked), cls(enforcement.hosts_blocked));
+    set('firewallBlocked', bool(enforcement.firewall_blocked), cls(enforcement.firewall_blocked));
+    set('updateLocked', bool(runtime.update_locked), cls(runtime.update_locked));
+    set('killed', (enforcement.killed || []).length + ' 个');
+    $('whitelist').value = (cfg.protection?.whitelist || []).join('\n');
+    set('protectionState', cfg.protection?.enabled ? '防护已开启' : '防护已关闭', cfg.protection?.enabled ? 'ok' : 'warn');
+    set('autostart', bool(cfg.ui?.autostart), cls(cfg.ui?.autostart));
+    set('updatePaths', (cfg.update_lock?.paths || []).join('；') || '-');
+    const doctor = $('doctor');
+    doctor.innerHTML = '';
+    for (const row of data.doctor || []) {
+      const dt = document.createElement('dt');
+      dt.textContent = row.name;
+      const dd = document.createElement('dd');
+      dd.textContent = row.detail;
+      dd.className = row.ok ? 'ok' : 'warn';
+      doctor.append(dt, dd);
+    }
+    $('log').textContent = $('log').textContent === '加载中…' ? '点击“刷新日志”读取' : $('log').textContent;
+  }
+
+  async function refresh() {
+    try {
+      render(await api('/api/status'));
+    } catch (error) {
+      toast(error.message);
+    }
+  }
+
+  async function act(fn, success) {
+    try {
+      const result = await fn();
+      toast(success || '完成');
+      await refresh();
+      return result;
+    } catch (error) {
+      toast(error.message);
+      return null;
+    }
+  }
+
+  $('checkBtn').onclick = () => act(async () => {
+    const data = await api('/api/check', {});
+    render({ ...(await api('/api/status')), runtime: data.runtime });
+    return data;
+  }, '检测完成');
+
+  $('saveWhitelist').onclick = () => act(() => api('/api/whitelist', {
+    entries: $('whitelist').value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
+  }), '白名单已保存');
+
+  $('toggleProtection').onclick = () => act(async () => {
+    const data = await api('/api/status');
+    return api('/api/protection', { enabled: !data.config.protection.enabled });
+  }, '防护状态已切换');
+
+  $('takeover').onclick = () => act(() => api('/api/codex/takeover', { auth: $('authMode').value }), 'Codex 配置已接管');
+
+  $('restore').onclick = () => act(() => api('/api/codex/restore', { force: false }), '已恢复原配置');
+
+  $('probe').onclick = () => act(async () => {
+    const data = await api('/api/codex/probe', {});
+    toast(data.probe?.detail || '采集完成');
+    return data;
+  }, '采集完成');
+
+  $('importSub').onclick = () => act(() => api('/api/codex/subscription', { url: $('subscription').value }), '订阅已导入');
+
+  $('toggleUpdate').onclick = () => act(async () => {
+    const data = await api('/api/status');
+    return api('/api/update-lock', { enabled: !data.config.update_lock.enabled });
+  }, '更新锁状态已切换');
+
+  $('toggleAutostart').onclick = () => act(async () => {
+    const data = await api('/api/status');
+    return api('/api/autostart', { enabled: !data.config.ui.autostart });
+  }, '自启动状态已切换');
+
+  $('refreshLog').onclick = () => act(async () => {
+    const data = await api('/api/logs');
+    $('log').textContent = data.log || '没有日志';
+  }, '日志已刷新');
+
+  refresh();
+  setInterval(refresh, 4000);
+})();
+</script>
+</body>
+</html>
