@@ -1,0 +1,158 @@
+import { Button, CheckBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    title: "GPTGuard";
+    width: 920px;
+    height: 620px;
+    background: #f6f7fb;
+
+    in property <string> status_text: "正在启动";
+    in property <string> detail_text: "正在连接 GPTGuard 后台";
+    in property <string> route_text: "自动检测本机代理，或导入订阅";
+    in property <string> codex_text: "正在检测 Codex 配置";
+    in property <bool> protection_enabled: false;
+    in property <bool> setup_needed: true;
+    in property <string> takeover_label: "确认接管配置";
+    in-out property <string> subscription_text: "";
+
+    callback refresh_clicked();
+    callback diagnostics_clicked();
+    callback about_clicked();
+    callback import_clicked(string);
+    callback file_clicked();
+    callback takeover_clicked();
+    callback restore_clicked();
+    callback protection_clicked(bool);
+
+    VerticalBox {
+        padding: 28px;
+        spacing: 18px;
+
+        HorizontalBox {
+            spacing: 12px;
+            Text {
+                text: "GPTGuard";
+                font-size: 28px;
+                font-weight: 700;
+                color: #182033;
+            }
+            Text {
+                text: "出口保护与 Codex 网关";
+                vertical-alignment: center;
+                color: #687089;
+                font-size: 14px;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "立即检测";
+                clicked => { root.refresh_clicked(); }
+            }
+            Button {
+                text: "查看诊断";
+                clicked => { root.diagnostics_clicked(); }
+            }
+
+            Button {
+                text: "关于";
+                clicked => { root.about_clicked(); }
+            }
+        }
+
+        Rectangle {
+            height: 112px;
+            background: root.protection_enabled ? #e8f7ee : #fff4dc;
+            border-radius: 14px;
+            border-width: 1px;
+            border-color: root.protection_enabled ? #b6e3c7 : #f0d18a;
+
+            HorizontalBox {
+                padding: 20px;
+                spacing: 16px;
+                VerticalBox {
+                    spacing: 5px;
+                    Text {
+                        text: root.status_text;
+                        font-size: 24px;
+                        font-weight: 700;
+                        color: #182033;
+                    }
+                    Text { text: root.detail_text; color: #536078; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                CheckBox {
+                    text: root.protection_enabled ? "保护已开启" : "开启严格保护";
+                    checked: root.protection_enabled;
+                    toggled => { root.protection_clicked(self.checked); }
+                }
+            }
+        }
+
+        HorizontalBox {
+            spacing: 16px;
+            Rectangle {
+                horizontal-stretch: 1;
+                background: white;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: #e1e5ee;
+                VerticalBox {
+                    padding: 18px;
+                    spacing: 10px;
+                    Text { text: "出口"; font-size: 18px; font-weight: 700; color: #182033; }
+                    Text { text: root.route_text; color: #536078; wrap: word-wrap; }
+                    LineEdit {
+                        placeholder-text: "粘贴订阅地址（可选）";
+                        text <=> root.subscription_text;
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button { text: "导入并检测"; clicked => { root.import_clicked(root.subscription_text); } }
+                        Button { text: "选择文件"; clicked => { root.file_clicked(); } }
+                        Button { text: "刷新状态"; clicked => { root.refresh_clicked(); } }
+                    }
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+                background: white;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: #e1e5ee;
+                VerticalBox {
+                    padding: 18px;
+                    spacing: 10px;
+                    Text { text: "Codex"; font-size: 18px; font-weight: 700; color: #182033; }
+                    Text { text: root.codex_text; color: #536078; wrap: word-wrap; }
+                    Button { text: root.takeover_label; enabled: root.setup_needed; clicked => { root.takeover_clicked(); } }
+                    Button { text: "恢复原配置"; clicked => { root.restore_clicked(); } }
+                }
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            background: white;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #e1e5ee;
+            ScrollView {
+                        content-width: self.width;
+                VerticalBox {
+                    padding: 18px;
+                    spacing: 8px;
+                    Text { text: "使用说明"; font-size: 18px; font-weight: 700; color: #182033; }
+                    Text {
+                        text: "首次使用：先导入订阅或复用本机代理，再点击“立即检测”。检测通过后，确认 Codex 配置差异并开启严格保护。节点退出、出口失配或内核损坏时，GPTGuard 会停止转发，不会自动走直连。";
+                        color: #536078;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "所有内部端口只监听 127.0.0.1，用户不需要填写端口。管理界面是本地 Rust 桌面窗口，不会打开浏览器。";
+                        color: #536078;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+    }
+}

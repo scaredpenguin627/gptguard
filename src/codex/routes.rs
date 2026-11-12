@@ -1,8 +1,6 @@
 //! Egress routes and subscription import.
 //!
-//! Route support is intentionally explicit: HTTP, HTTPS and SOCKS5 URLs, plus
-//! a small Clash/Mihomo YAML subset. Protocols that need a full proxy core are
-//! rejected with a clear message instead of being silently skipped.
+//! Native HTTP/SOCKS routes and isolated Mihomo outbound nodes.
 
 use std::time::Duration;
 
@@ -10,8 +8,9 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
-use crate::config::{validate_proxy_url, AppPaths, Config, RouteConfig};
+use crate::config::{detect_local_proxy, validate_proxy_url, Config, RouteConfig};
 use crate::util;
 
 #[derive(Debug, Clone)]
@@ -70,17 +69,15 @@ pub fn build_routes(config: &Config) -> Result<Vec<Route>> {
     let mut routes = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for route in config.codex.routes.iter().filter(|route| route.enabled) {
+        if route.mihomo.is_some() {
+            continue; // Requires a managed sidecar; never reinterpret as direct.
+        }
         if !seen.insert(route.id.clone()) {
             continue;
         }
         routes.push(Route::from_config(route)?);
     }
     if config.codex.direct && seen.insert("direct".into()) {
-        routes.push(Route::direct()?);
-    }
-    if routes.is_empty() {
-        // Falling back to direct is safer than a proxy process that cannot
-        // start. The request path will still report no_routes if direct is off.
         routes.push(Route::direct()?);
     }
     Ok(routes)
@@ -137,30 +134,47 @@ pub struct ImportResult {
     pub errors: Vec<String>,
 }
 
-pub async fn import_subscription(
-    config: &mut Config,
-    paths: &AppPaths,
-    url: &str,
-) -> Result<ImportResult> {
-    let client = build_client(None)?;
+pub async fn import_subscription(config: &mut Config, url: &str) -> Result<ImportResult> {
+    let detected_proxy = detect_local_proxy();
+    let client = build_client(detected_proxy.as_deref())?;
     let response = client
         .get(url)
         .timeout(Duration::from_secs(30))
         .send()
         .await
-        .with_context(|| format!("fetch subscription {}", util::mask_url(url)))?;
+        .map_err(|_| anyhow::anyhow!("fetch subscription failed"))?;
     if !response.status().is_success() {
         bail!("subscription returned HTTP {}", response.status());
     }
-    let body = response.text().await.context("read subscription body")?;
+    let body = response
+        .text()
+        .await
+        .map_err(|_| anyhow::anyhow!("read subscription body failed"))?;
     if body.len() > 4 * 1024 * 1024 {
         bail!("subscription body is too large");
     }
     let parsed = parse_subscription(&body);
-    config.codex.routes.extend(parsed.routes);
+    merge_routes(config, parsed.routes);
     config.codex.subscriptions.push(util::mask_url(url));
-    config.save(paths)?;
     Ok(parsed.result)
+}
+
+pub fn merge_routes(config: &mut Config, routes: Vec<RouteConfig>) {
+    if !routes.is_empty() {
+        config.codex.direct = false;
+        // Every imported route is normalized through the embedded Mihomo
+        // supervisor.  That keeps SS/VMess/VLESS/Trojan/Hysteria and ordinary
+        // HTTP/SOCKS proxies on the same loopback-only, fail-closed path.
+        config.mihomo.enabled = true;
+        config.protection.ip_check_mode = crate::config::IpCheckMode::Http;
+    }
+    for route in routes {
+        if let Some(existing) = config.codex.routes.iter_mut().find(|r| r.id == route.id) {
+            *existing = route;
+        } else {
+            config.codex.routes.push(route);
+        }
+    }
 }
 
 pub fn parse_subscription(body: &str) -> ParsedSubscription {
@@ -242,8 +256,14 @@ fn parse_proxy_line(line: &str) -> Result<Option<RouteConfig>> {
         Err(_) => return Ok(None),
     };
     let scheme = parsed.scheme();
+    if matches!(
+        scheme,
+        "ss" | "vmess" | "vless" | "trojan" | "hysteria" | "hysteria2"
+    ) {
+        return parse_sidecar_uri(line, without_fragment, scheme);
+    }
     if !matches!(scheme, "http" | "https" | "socks5" | "socks5h") {
-        return Ok(None);
+        bail!("此协议请使用 Clash/Mihomo YAML 节点导入");
     }
     if parsed.host_str().is_none() || parsed.port().is_none() {
         return Ok(None);
@@ -264,6 +284,7 @@ fn parse_proxy_line(line: &str) -> Result<Option<RouteConfig>> {
         id: format!("route-{}", short_id(without_fragment)),
         label,
         url: without_fragment.to_string(),
+        mihomo: None,
         enabled: true,
     }))
 }
@@ -278,7 +299,7 @@ fn proxy_to_route(proxy: &serde_yaml::Value) -> Result<Option<RouteConfig>> {
         "http" => "http",
         "https" => "https",
         "socks5" | "socks" => "socks5",
-        _ => return Ok(None),
+        _ => return sidecar_route(proxy),
     };
     let server = proxy
         .get("server")
@@ -294,16 +315,284 @@ fn proxy_to_route(proxy: &serde_yaml::Value) -> Result<Option<RouteConfig>> {
         .unwrap_or("proxy");
     let username = proxy.get("username").and_then(|value| value.as_str());
     let password = proxy.get("password").and_then(|value| value.as_str());
-    let auth = match (username, password) {
-        (Some(user), Some(pass)) => format!("{user}:{pass}@"),
-        _ => String::new(),
+    if port == 0 || port > 65535 {
+        bail!("invalid proxy port");
+    }
+    // Preserve TLS and other protocol options for Mihomo instead of silently
+    // discarding them when translating a YAML node into a URL.
+    if proxy.as_mapping().is_some_and(|map| {
+        map.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                Some("name" | "type" | "server" | "port" | "username" | "password")
+            )
+        })
+    }) {
+        return sidecar_route(proxy);
+    }
+    let host = if server.contains(':') {
+        format!("[{server}]")
+    } else {
+        server.to_string()
     };
-    let url = format!("{scheme}://{auth}{server}:{port}");
+    let mut parsed = url::Url::parse(&format!("{scheme}://{host}:{port}"))?;
+    if let Some(user) = username {
+        parsed
+            .set_username(user)
+            .map_err(|_| anyhow::anyhow!("invalid proxy username"))?;
+    }
+    if let Some(pass) = password {
+        parsed
+            .set_password(Some(pass))
+            .map_err(|_| anyhow::anyhow!("invalid proxy password"))?;
+    }
+    let url = parsed.to_string();
     validate_proxy_url(&url)?;
     Ok(Some(RouteConfig {
         id: format!("route-{}", short_id(&url)),
         label: name.to_string(),
         url,
+        mihomo: None,
+        enabled: true,
+    }))
+}
+
+fn parse_sidecar_uri(
+    original: &str,
+    without_fragment: &str,
+    scheme: &str,
+) -> Result<Option<RouteConfig>> {
+    let label = original
+        .split_once('#')
+        .map(|(_, label)| percent_decode(label))
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| scheme.to_string());
+    let node = match scheme {
+        "ss" => parse_ss_uri(without_fragment)?,
+        "vmess" => parse_vmess_uri(without_fragment)?,
+        "vless" => parse_vless_uri(without_fragment)?,
+        "trojan" => parse_trojan_uri(without_fragment)?,
+        "hysteria" | "hysteria2" => parse_hysteria_uri(without_fragment, scheme)?,
+        _ => unreachable!(),
+    };
+    crate::mihomo::validate_node(&node).map_err(|_| anyhow::anyhow!("无效的 {scheme} URI"))?;
+    Ok(Some(RouteConfig {
+        id: format!("node-{}", short_id(without_fragment)),
+        label,
+        url: String::new(),
+        mihomo: Some(node),
+        enabled: true,
+    }))
+}
+
+fn parse_ss_uri(value: &str) -> Result<Value> {
+    let mut parsed = url::Url::parse(value).map_err(|_| anyhow::anyhow!("无效的 ss URI"))?;
+    if parsed.host_str().is_none() || parsed.port().is_none() {
+        let encoded = value
+            .strip_prefix("ss://")
+            .ok_or_else(|| anyhow::anyhow!("无效的 ss URI"))?;
+        let decoded = decode_uri_base64(encoded)?;
+        parsed = url::Url::parse(&format!("ss://{decoded}"))
+            .map_err(|_| anyhow::anyhow!("无效的 ss URI"))?;
+    }
+    let (cipher, password) = if !parsed.username().is_empty() {
+        if let Ok(decoded) = decode_uri_base64(parsed.username()) {
+            split_ss_credentials(&decoded)?
+        } else if parsed.username().contains(':') {
+            split_ss_credentials(parsed.username())?
+        } else {
+            (
+                percent_decode(parsed.username()),
+                parsed.password().map(percent_decode).unwrap_or_default(),
+            )
+        }
+    } else {
+        let encoded = value
+            .strip_prefix("ss://")
+            .and_then(|raw| raw.split_once('@').map(|(user, _)| user))
+            .ok_or_else(|| anyhow::anyhow!("无效的 ss URI"))?;
+        split_ss_credentials(&decode_uri_base64(encoded)?)?
+    };
+    Ok(json!({
+        "type": "ss",
+        "server": parsed.host_str().unwrap_or_default(),
+        "port": parsed.port().unwrap_or(0),
+        "cipher": cipher,
+        "password": password,
+    }))
+}
+
+fn split_ss_credentials(value: &str) -> Result<(String, String)> {
+    let (cipher, password) = value
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("无效的 ss URI"))?;
+    if cipher.is_empty() || password.is_empty() {
+        bail!("无效的 ss URI");
+    }
+    Ok((percent_decode(cipher), percent_decode(password)))
+}
+
+fn parse_vmess_uri(value: &str) -> Result<Value> {
+    let encoded = value
+        .strip_prefix("vmess://")
+        .ok_or_else(|| anyhow::anyhow!("无效的 vmess URI"))?;
+    let raw = decode_uri_base64(encoded)?;
+    let source: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|_| anyhow::anyhow!("无效的 vmess URI"))?;
+    let server = source["add"].as_str().unwrap_or_default();
+    let port = source["port"]
+        .as_u64()
+        .or_else(|| source["port"].as_str().and_then(|v| v.parse().ok()))
+        .unwrap_or(0);
+    let uuid = source["id"].as_str().unwrap_or_default();
+    let mut node = json!({
+        "type": "vmess",
+        "server": server,
+        "port": port,
+        "uuid": uuid,
+        "alterId": source["aid"].as_u64().unwrap_or(0),
+        "cipher": source["scy"].as_str().unwrap_or("auto"),
+        "udp": true,
+    });
+    apply_transport(&mut node, &source);
+    Ok(node)
+}
+
+fn parse_vless_uri(value: &str) -> Result<Value> {
+    let parsed = url::Url::parse(value).map_err(|_| anyhow::anyhow!("无效的 vless URI"))?;
+    let mut node = json!({
+        "type": "vless",
+        "server": parsed.host_str().unwrap_or_default(),
+        "port": parsed.port().unwrap_or(0),
+        "uuid": percent_decode(parsed.username()),
+        "udp": true,
+    });
+    apply_query_transport(&mut node, &parsed);
+    Ok(node)
+}
+
+fn parse_trojan_uri(value: &str) -> Result<Value> {
+    let parsed = url::Url::parse(value).map_err(|_| anyhow::anyhow!("无效的 trojan URI"))?;
+    let mut node = json!({
+        "type": "trojan",
+        "server": parsed.host_str().unwrap_or_default(),
+        "port": parsed.port().unwrap_or(0),
+        "password": percent_decode(parsed.username()),
+        "udp": true,
+    });
+    apply_query_transport(&mut node, &parsed);
+    node["tls"] = json!(true);
+    Ok(node)
+}
+
+fn parse_hysteria_uri(value: &str, scheme: &str) -> Result<Value> {
+    let parsed = url::Url::parse(value).map_err(|_| anyhow::anyhow!("无效的 {scheme} URI"))?;
+    let mut node = json!({
+        "type": scheme,
+        "server": parsed.host_str().unwrap_or_default(),
+        "port": parsed.port().unwrap_or(0),
+        "auth-str": percent_decode(parsed.username()),
+        "udp": true,
+    });
+    if scheme == "hysteria2" {
+        node["password"] = json!(percent_decode(parsed.username()));
+        node.as_object_mut().unwrap().remove("auth-str");
+    }
+    apply_query_transport(&mut node, &parsed);
+    Ok(node)
+}
+
+fn apply_transport(node: &mut Value, source: &Value) {
+    let network = source["net"].as_str().unwrap_or_default();
+    if !network.is_empty() {
+        node["network"] = json!(network);
+    }
+    if source["tls"].as_str().is_some_and(|v| v == "tls") || source["tls"].as_bool() == Some(true) {
+        node["tls"] = json!(true);
+    }
+    if let Some(host) = source["host"].as_str().filter(|v| !v.is_empty()) {
+        node["ws-opts"]["headers"]["Host"] = json!(host);
+    }
+    if let Some(path) = source["path"].as_str().filter(|v| !v.is_empty()) {
+        node["ws-opts"]["path"] = json!(path);
+    }
+    if let Some(sni) = source["sni"].as_str().filter(|v| !v.is_empty()) {
+        node["servername"] = json!(sni);
+    }
+}
+
+fn apply_query_transport(node: &mut Value, parsed: &url::Url) {
+    let query = parsed
+        .query_pairs()
+        .collect::<std::collections::HashMap<_, _>>();
+    let network = query.get("type").map(|v| v.as_ref()).unwrap_or_default();
+    if !network.is_empty() {
+        node["network"] = json!(network);
+    }
+    if query
+        .get("security")
+        .is_some_and(|v| v == "tls" || v == "reality")
+    {
+        node["tls"] = json!(true);
+    }
+    if let Some(sni) = query.get("sni").filter(|v| !v.is_empty()) {
+        node["servername"] = json!(sni.as_ref());
+    }
+    if let Some(path) = query.get("path").filter(|v| !v.is_empty()) {
+        node["ws-opts"]["path"] = json!(path.as_ref());
+    }
+    if let Some(host) = query.get("host").filter(|v| !v.is_empty()) {
+        node["ws-opts"]["headers"]["Host"] = json!(host.as_ref());
+    }
+    if let Some(public_key) = query.get("pbk").filter(|v| !v.is_empty()) {
+        node["reality-opts"]["public-key"] = json!(public_key.as_ref());
+    }
+    if let Some(short_id) = query.get("sid").filter(|v| !v.is_empty()) {
+        node["reality-opts"]["short-id"] = json!(short_id.as_ref());
+    }
+}
+
+fn decode_uri_base64(value: &str) -> Result<String> {
+    let compact = value.trim().trim_end_matches('=');
+    for engine in [&URL_SAFE_NO_PAD, &URL_SAFE, &STANDARD] {
+        if let Ok(bytes) = engine.decode(compact) {
+            if let Ok(text) = String::from_utf8(bytes) {
+                return Ok(text);
+            }
+        }
+    }
+    bail!("无效的 URI 编码")
+}
+
+fn percent_decode(value: &str) -> String {
+    url::form_urlencoded::parse(format!("x={value}").as_bytes())
+        .next()
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn sidecar_route(proxy: &serde_yaml::Value) -> Result<Option<RouteConfig>> {
+    let mut node = serde_json::to_value(proxy).context("invalid node data")?;
+    match node.get("type").and_then(|v| v.as_str()) {
+        Some("https") => {
+            node["type"] = serde_json::json!("http");
+            node["tls"] = serde_json::json!(true);
+        }
+        Some("socks") => node["type"] = serde_json::json!("socks5"),
+        _ => {}
+    }
+    crate::mihomo::validate_node(&node)?;
+    let label = node
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("proxy")
+        .to_string();
+    node.as_object_mut().unwrap().remove("name");
+    Ok(Some(RouteConfig {
+        id: format!("node-{}", short_id(&node.to_string())),
+        label,
+        url: String::new(),
+        mihomo: Some(node),
         enabled: true,
     }))
 }
@@ -333,7 +622,34 @@ mod tests {
     }
 
     #[test]
-    fn parses_clash_http_proxies_and_skips_unsupported() {
+    fn parses_common_sidecar_uri_protocols() {
+        let vmess = URL_SAFE_NO_PAD.encode(
+            serde_json::to_string(&json!({
+                "v": "2", "ps": "vmess", "add": "example.test", "port": 443,
+                "id": "00000000-0000-0000-0000-000000000000", "aid": 0,
+                "net": "ws", "path": "/codex", "host": "example.test", "tls": "tls"
+            }))
+            .unwrap(),
+        );
+        let ss = URL_SAFE_NO_PAD.encode("aes-128-gcm:secret@example.test:8388");
+        let body = format!(
+            "ss://{ss}#ss\nvmess://{vmess}#vmess\nvless://00000000-0000-0000-0000-000000000000@example.test:443?type=ws&security=tls&path=%2Fvless#vless\ntrojan://secret@example.test:443?sni=example.test#trojan\nhysteria://secret@example.test:443?sni=example.test#hysteria\nhysteria2://secret@example.test:443?sni=example.test#hysteria2\n"
+        );
+        let parsed = parse_subscription(&body);
+        assert_eq!(parsed.routes.len(), 6, "{:?}", parsed.result.errors);
+        let types = parsed
+            .routes
+            .iter()
+            .map(|route| route.mihomo.as_ref().unwrap()["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            ["ss", "vmess", "vless", "trojan", "hysteria", "hysteria2"]
+        );
+    }
+
+    #[test]
+    fn parses_clash_http_and_sidecar_nodes() {
         let body = r#"
 proxies:
   - name: local
@@ -346,13 +662,72 @@ proxies:
     port: 8388
 "#;
         let parsed = parse_subscription(body);
-        assert_eq!(parsed.routes.len(), 1);
-        assert_eq!(parsed.result.skipped, 1);
+        assert_eq!(parsed.routes.len(), 2);
+        assert_eq!(parsed.result.skipped, 0);
+        assert_eq!(parsed.routes[1].mihomo.as_ref().unwrap()["type"], "ss");
     }
 
     #[test]
     fn rejects_missing_port() {
         let parsed = parse_subscription("socks5://127.0.0.1#no-port");
         assert!(parsed.routes.is_empty());
+    }
+
+    #[test]
+    fn empty_pool_never_falls_back_to_direct() {
+        let mut cfg = Config::default();
+        cfg.codex.direct = false;
+        assert!(build_routes(&cfg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn merging_imported_routes_enables_embedded_mihomo() {
+        let mut cfg = Config::default();
+        let parsed = parse_subscription(
+            "proxies:\n  - {name: ss, type: ss, server: example.test, port: 443, cipher: aes-128-gcm, password: secret}",
+        );
+        merge_routes(&mut cfg, parsed.routes);
+        assert!(cfg.mihomo.enabled);
+        assert!(!cfg.codex.direct);
+        assert_eq!(
+            cfg.protection.ip_check_mode,
+            crate::config::IpCheckMode::Http
+        );
+    }
+
+    #[test]
+    fn imports_protocol_fields_but_not_top_level_settings() {
+        let parsed = parse_subscription(
+            r#"
+tun: {enable: true}
+external-controller: 0.0.0.0:9090
+rules: [MATCH,DIRECT]
+listeners: [{type: http, port: 5555}]
+proxies:
+  - {name: a, type: ss, server: example.test, port: 443, cipher: aes-128-gcm, password: secret}
+  - {name: b, type: vmess, server: example.test, port: 443, uuid: test, alterId: 0, network: ws, ws-opts: {path: /ws}}
+  - {name: c, type: vless, server: example.test, port: 443, uuid: test, tls: true, reality-opts: {public-key: key, short-id: ab}}
+  - {name: d, type: trojan, server: example.test, port: 443, password: secret, sni: tls.test}
+  - {name: e, type: hysteria, server: example.test, port: 443, auth-str: secret, up: 10, down: 50}
+  - {name: f, type: hysteria2, server: example.test, port: 443, password: secret, obfs: salamander, obfs-password: obfs}
+"#,
+        );
+        assert_eq!(parsed.routes.len(), 6, "{:?}", parsed.result.errors);
+        assert_eq!(
+            parsed.routes[2].mihomo.as_ref().unwrap()["reality-opts"]["public-key"],
+            "key"
+        );
+        assert_eq!(
+            parsed.routes[1].mihomo.as_ref().unwrap()["ws-opts"]["path"],
+            "/ws"
+        );
+        for route in parsed.routes {
+            assert!(route.url.is_empty());
+            assert!(route.mihomo.as_ref().unwrap().get("tun").is_none());
+        }
+        let bad = parse_subscription("proxies:\n  - {type: vless, server: x, port: 443, dialer-proxy: DIRECT, password: SECRET}");
+        assert!(bad.routes.is_empty());
+        assert_eq!(bad.result.errors.len(), 1);
+        assert!(!bad.result.errors[0].contains("SECRET"));
     }
 }

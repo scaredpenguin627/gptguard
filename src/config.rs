@@ -4,7 +4,7 @@
 //! panel and the daemon all read exactly the same settings.
 
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -28,7 +28,7 @@ pub const DEFAULT_MODELS: [&str; 7] = [
     "gpt-6.2-astra",
     "gpt-6.2-sol",
 ];
-const CONFIG_VERSION: u32 = 1;
+const CONFIG_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -150,7 +150,11 @@ impl Default for StateFallback {
 pub struct RouteConfig {
     pub id: String,
     pub label: String,
+    #[serde(default)]
     pub url: String,
+    /// A single outbound node, never an entire imported Mihomo configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mihomo: Option<serde_json::Value>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -366,6 +370,8 @@ pub struct Config {
     #[serde(default)]
     pub codex: CodexConfig,
     #[serde(default)]
+    pub mihomo: crate::mihomo::MihomoConfig,
+    #[serde(default)]
     pub update_lock: UpdateLockConfig,
     #[serde(default)]
     pub ui: UiConfig,
@@ -381,6 +387,7 @@ impl Default for Config {
             version: CONFIG_VERSION,
             protection: ProtectionConfig::default(),
             codex: CodexConfig::default(),
+            mihomo: crate::mihomo::MihomoConfig::default(),
             update_lock: UpdateLockConfig::default(),
             ui: UiConfig::default(),
         }
@@ -438,6 +445,16 @@ impl Config {
                 .with_context(|| format!("read {}", paths.config_file.display()))?;
             let mut cfg: Config = serde_json::from_str(&raw)
                 .with_context(|| format!("parse {}", paths.config_file.display()))?;
+            if cfg.version == 1 {
+                // v0.3/v0.4 stored the same runtime model but exposed the
+                // browser panel and a user-supplied Mihomo executable.  Keep
+                // the document readable for rollback, but stop using the
+                // external executable when the native v2 runtime takes over.
+                cfg.version = CONFIG_VERSION;
+                cfg.ui.open_panel_on_start = false;
+                cfg.mihomo.executable = None;
+                cfg.save(paths)?;
+            }
             if cfg.ui.admin_token.is_empty() {
                 cfg.ui.admin_token = random_token();
                 cfg.save(paths)?;
@@ -461,7 +478,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.version != CONFIG_VERSION {
+        if self.version != CONFIG_VERSION && self.version != 1 {
             bail!("unsupported config version {}", self.version);
         }
         if self.protection.interval_seconds < 1 || self.protection.interval_seconds > 300 {
@@ -548,9 +565,19 @@ impl Config {
             validate_upstream(upstream)?;
         }
         for route in &self.codex.routes {
-            validate_proxy_url(&route.url)
-                .with_context(|| format!("invalid route {} ({})", route.id, route.label))?;
+            if !route.enabled {
+                continue;
+            }
+            if let Some(node) = &route.mihomo {
+                if !route.url.is_empty() {
+                    bail!("route must contain either url or mihomo, not both");
+                }
+                crate::mihomo::validate_node(node)?;
+            } else {
+                validate_proxy_url(&route.url).context("invalid route URL")?;
+            }
         }
+        crate::mihomo::validate_config(self)?;
         if self.codex.direct == false && self.codex.routes.iter().all(|route| !route.enabled) {
             // Not fatal: the proxy will report no_routes, which is clearer than
             // silently falling back to direct.
@@ -624,6 +651,73 @@ pub fn validate_proxy_url(value: &str) -> Result<()> {
         bail!("proxy URL has no port");
     }
     Ok(())
+}
+
+/// Detect a proxy that is already running on this machine.  The native UI
+/// uses this as a zero-configuration hint; it never changes the Windows
+/// system proxy and never exposes the port to the user.
+pub fn detect_local_proxy() -> Option<String> {
+    for key in ["GPTGUARD_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() && validate_proxy_url(value).is_ok() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    #[cfg(windows)]
+    if let Some(proxy) = detect_windows_proxy() {
+        return Some(proxy);
+    }
+    for port in [7890u16, 7891, 1080, 10808, 20170] {
+        if TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], port)),
+            std::time::Duration::from_millis(120),
+        )
+        .is_ok()
+        {
+            return Some(format!("http://127.0.0.1:{port}"));
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn detect_windows_proxy() -> Option<String> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
+        .ok()?;
+    let enabled: u32 = key.get_value("ProxyEnable").ok()?;
+    if enabled == 0 {
+        return None;
+    }
+    let raw: String = key.get_value("ProxyServer").ok()?;
+    for entry in raw
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let value = entry
+            .split_once('=')
+            .map(|(_, value)| value)
+            .unwrap_or(entry)
+            .trim();
+        if value.eq_ignore_ascii_case("<local>") {
+            continue;
+        }
+        let candidate = if value.contains("://") {
+            value.to_string()
+        } else {
+            format!("http://{value}")
+        };
+        if validate_proxy_url(&candidate).is_ok() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 pub fn validate_upstream(value: &str) -> Result<()> {
@@ -796,5 +890,31 @@ mod tests {
         assert!(validate_upstream("http://example.com/v1").is_err());
         assert!(validate_upstream("http://127.0.0.1:8080/v1").is_ok());
         assert!(validate_upstream("https://chatgpt.com/backend-api/codex").is_ok());
+    }
+
+    #[test]
+    fn migrates_v1_config_to_v2_on_load() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            config_file: root.path().join("config/config.json"),
+            state_file: root.path().join("data/state.json"),
+            log_dir: root.path().join("data/logs"),
+            backups_dir: root.path().join("data/backups"),
+            lock_file: root.path().join("data/gptguard.lock"),
+        };
+        paths.ensure().unwrap();
+        fs::write(
+            &paths.config_file,
+            r#"{"version":1,"mihomo":{"enabled":false,"executable":"C:\\old\\mihomo.exe"}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_or_create(&paths).unwrap();
+        assert_eq!(cfg.version, 2);
+        assert!(cfg.mihomo.executable.is_none());
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&paths.config_file).unwrap()).unwrap();
+        assert_eq!(saved["version"], 2);
     }
 }

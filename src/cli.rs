@@ -21,8 +21,8 @@ use crate::util;
     about = "GPTGuard / GPTGuard: 出口守卫与 Codex turn-state 转发"
 )]
 pub struct Cli {
-    /// Running `gptguard.exe` without arguments starts the tray, which is the
-    /// double-click path for non-CLI users.
+    /// Running `GPTGuard.exe` without arguments starts the native Slint
+    /// window; the tray is started alongside it by the same executable.
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -58,6 +58,16 @@ enum Command {
         ip: String,
     },
     ListIps,
+    /// 导入和查看代理节点（修改前停止守护）
+    Routes {
+        #[command(subcommand)]
+        action: RoutesAction,
+    },
+    /// 配置独立 Mihomo 进程（修改前停止守护）
+    Mihomo {
+        #[command(subcommand)]
+        action: MihomoAction,
+    },
     /// 修改配置：ip-check-mode/interval/model/fallback/account-mode/fixed-model/network-guard/kill-on-block/http-proxy
     Set {
         key: String,
@@ -109,6 +119,25 @@ enum ModelsAction {
 }
 
 #[derive(Subcommand)]
+enum RoutesAction {
+    Import { file: std::path::PathBuf },
+    Subscribe { url: String },
+    List,
+}
+
+#[derive(Subcommand)]
+enum MihomoAction {
+    Enable {
+        #[arg(long)]
+        executable: Option<std::path::PathBuf>,
+        #[arg(long, default_value_t = 17890)]
+        base_port: u16,
+    },
+    Disable,
+    Status,
+}
+
+#[derive(Subcommand)]
 enum StateAction {
     List,
     AddBlock { blocks: usize },
@@ -138,7 +167,11 @@ enum OnOff {
 }
 
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let mut args = std::env::args_os().collect::<Vec<_>>();
+    if args.get(1).is_some_and(|arg| arg == "--cli") {
+        args.remove(1);
+    }
+    let cli = Cli::parse_from(args);
     let paths = AppPaths::discover();
     paths.ensure()?;
     let command = cli.command.unwrap_or(Command::Tray { start_guard: true });
@@ -157,6 +190,8 @@ pub fn run() -> Result<()> {
         Command::AddIp { ip } => add_ip(&paths, &ip, true),
         Command::RemoveIp { ip } => add_ip(&paths, &ip, false),
         Command::ListIps => list_ips(&paths),
+        Command::Routes { action } => block_on(routes_command(&paths, action)),
+        Command::Mihomo { action } => mihomo_command(&paths, action),
         Command::Set { key, value } => set(&paths, &key, &value),
         Command::Model { model } => set_model(&paths, &model),
         Command::Models { action } => models(&paths, action),
@@ -167,6 +202,116 @@ pub fn run() -> Result<()> {
 
         Command::Guard { command } => block_on(guarded(command, paths)),
     }
+}
+
+fn require_stopped(paths: &AppPaths) -> Result<()> {
+    if service::daemon_running(paths) {
+        bail!("请先运行 gptguard stop，再修改节点或 Mihomo 配置");
+    }
+    Ok(())
+}
+
+async fn routes_command(paths: &AppPaths, action: RoutesAction) -> Result<()> {
+    let mut config = Config::load_or_create(paths)?;
+    let result = match action {
+        RoutesAction::List => {
+            for route in &config.codex.routes {
+                let kind = route
+                    .mihomo
+                    .as_ref()
+                    .and_then(|v| v.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("http/socks");
+                println!(
+                    "{} | {} | {} | enabled={}",
+                    route.id, route.label, kind, route.enabled
+                );
+            }
+            return Ok(());
+        }
+        RoutesAction::Import { file } => {
+            require_stopped(paths)?;
+            if std::fs::metadata(&file)?.len() > 4 * 1024 * 1024 {
+                bail!("节点文件超过 4 MiB");
+            }
+            let parsed = crate::codex::routes::parse_subscription(&std::fs::read_to_string(file)?);
+            crate::codex::routes::merge_routes(&mut config, parsed.routes);
+            parsed.result
+        }
+        RoutesAction::Subscribe { url } => {
+            require_stopped(paths)?;
+            crate::codex::routes::import_subscription(&mut config, &url).await?
+        }
+    };
+    // Importing a pool is an explicit choice of proxies, including before
+    // enabling Mihomo. An unusable pool must not accidentally mean direct.
+    config.codex.direct = false;
+    config.save(paths)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    println!("节点已保存。协议节点需启用 Mihomo；启动守护后生效。");
+    Ok(())
+}
+
+fn mihomo_command(paths: &AppPaths, action: MihomoAction) -> Result<()> {
+    let mut config = Config::load_or_create(paths)?;
+    match action {
+        MihomoAction::Status => {
+            if let Some(state) = service::read_state(paths) {
+                println!("{}", serde_json::to_string_pretty(&state.codex.mihomo)?);
+            } else {
+                println!("守护未运行；Mihomo enabled={}", config.mihomo.enabled);
+            }
+            return Ok(());
+        }
+        MihomoAction::Enable {
+            executable,
+            base_port,
+        } => {
+            require_stopped(paths)?;
+            if let Some(path) = executable {
+                config.mihomo.executable = Some(
+                    path.canonicalize()
+                        .context("找不到 Mihomo 可执行文件")?
+                        .display()
+                        .to_string(),
+                );
+            }
+            config.mihomo.enabled = true;
+            config.mihomo.base_port = base_port;
+            config.codex.direct = false;
+            config.protection.ip_check_mode = crate::config::IpCheckMode::Http;
+            config.protection.http_proxy = None;
+        }
+        MihomoAction::Disable => {
+            require_stopped(paths)?;
+            config.mihomo.enabled = false;
+        }
+    }
+    config.save(paths)?;
+    println!("Mihomo enabled={}；启动守护后生效。", config.mihomo.enabled);
+    Ok(())
+}
+
+async fn daemon_post(
+    config: &Config,
+    paths: &AppPaths,
+    endpoint: &str,
+) -> Result<serde_json::Value> {
+    if !service::daemon_running(paths) {
+        bail!("请先启动 gptguard run，再检测或采集");
+    }
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .post(format!("http://127.0.0.1:{}{endpoint}", config.ui.web_port))
+        .header("x-gptguard-token", &config.ui.admin_token)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        bail!("守护返回 HTTP {}", response.status());
+    }
+    Ok(response.json().await?)
 }
 
 fn block_on<F: std::future::Future<Output = Result<()>>>(future: F) -> Result<()> {
@@ -189,10 +334,11 @@ fn setup(paths: AppPaths) -> Result<()> {
     println!("管理口令: {}", config.ui.admin_token);
     println!();
     println!("下一步:");
-    println!("  1. gptguard add-ip <你的代理出口 IP 或 CIDR>");
-    println!("  2. gptguard set ip-check-mode both|http|stun");
-    println!("  3. gptguard codex takeover --auth chatgpt");
+    println!("  1. 按 README 配置出口；协议节点使用 routes import 和 mihomo enable");
+    println!("  2. gptguard add-ip <真实出口 IP 或 CIDR>");
+    println!("  3. gptguard set protection true");
     println!("  4. gptguard run        # 或 gptguard tray");
+    println!("  5. 检测通过后，在另一个终端运行 gptguard codex takeover --auth chatgpt");
     println!();
     println!("目标程序:");
     for target in &config.protection.targets {
@@ -256,6 +402,14 @@ fn status(paths: &AppPaths) -> Result<()> {
 
 async fn check(paths: &AppPaths) -> Result<()> {
     let config = Config::load_or_create(paths)?;
+    if config.mihomo.enabled {
+        let data = daemon_post(&config, paths, "/api/check").await?;
+        println!("{}", serde_json::to_string_pretty(&data["runtime"])?);
+        if data["runtime"]["allowed"] != true {
+            bail!("出口检测未通过；请确认已开启防护");
+        }
+        return Ok(());
+    }
     let report = ipcheck::check(&config).await;
     println!("模式: {:?}", report.mode);
     println!(
@@ -417,6 +571,8 @@ fn set(paths: &AppPaths, key: &str, value: &str) -> Result<()> {
         "injection" => {
             config.codex.injection = value.parse().context("injection")?;
         }
+        "direct" => config.codex.direct = value.parse().context("direct")?,
+        "protection" => config.protection.enabled = value.parse().context("protection")?,
         _ => bail!("unknown key {key}"),
     }
     config.save(paths)?;
@@ -560,6 +716,14 @@ async fn codex(paths: &AppPaths, action: CodexAction) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
         CodexAction::Probe => {
+            if config.mihomo.enabled {
+                let data = daemon_post(&config, paths, "/api/codex/probe").await?;
+                println!("{}", serde_json::to_string_pretty(&data["probe"])?);
+                if data["probe"]["ok"] != true {
+                    bail!("没有采集到可用 state");
+                }
+                return Ok(());
+            }
             let proxy = ProxyRuntime::new(config, paths.clone())?;
             let report = proxy.probe_now().await;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -603,6 +767,9 @@ fn autostart(paths: &AppPaths, action: OnOff) -> Result<()> {
 
 async fn guarded(command: Vec<String>, paths: AppPaths) -> Result<()> {
     let config = Config::load_or_create(&paths)?;
+    if config.mihomo.enabled {
+        bail!("Mihomo 模式请使用 gptguard run 的出口防护，再启动目标程序");
+    }
     if command.is_empty() {
         bail!("缺少要启动的命令");
     }

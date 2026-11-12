@@ -1,201 +1,56 @@
-# Windows 使用与执行层
+# Windows 使用说明
 
-## 环境
+## 普通用户
 
-- Windows 10/11，x64。
-- Rust 1.85 或更新版本。没有 MSVC 链接器时用 GNU 工具链，见 README。
-- 修改 hosts、Windows 防火墙、更新目录 ACL 需要管理员权限。
-- 使用 Codex 前先完成官方登录，确认不经过本工具也能正常请求。
+1. 下载 Release 中唯一的 `GPTGuard-Setup-v0.4.0-windows-x64.exe`。
+2. 双击安装并启动 GPTGuard。
+3. 在原生窗口中完成代理检测、节点导入和 Codex 接管。
+4. 看到“已保护”后，可以关闭窗口。程序会留在通知区；从托盘退出会停止后台。
 
-## 启动顺序
+安装器不要求用户预先安装 Rust、Mihomo、PowerShell 脚本或浏览器面板。
 
-```powershell
-gptguard setup
-gptguard add-ip <可信出口 IP 或 CIDR>
-gptguard codex takeover --auth chatgpt
-gptguard run
-```
+## 首次启动没有代理
 
-需要托盘时用 `gptguard tray`。托盘会先启动守护。登录自启动写入：
+点击“选择文件”，导入 YAML、URI 或 Base64 节点文件。也可以粘贴订阅地址。GPTGuard 会解析节点，生成自己的 Mihomo 配置，并关闭订阅中的规则、DNS、TUN 和外部监听设置。
 
-```text
-HKCU\Software\Microsoft\Windows\CurrentVersion\Run
-GPTGuard = "<exe>" tray --start-guard
-```
+GPTGuard 只把 Mihomo 和 Codex 网关绑定到 `127.0.0.1`。端口由程序管理，用户无需填写。
 
-## 执行层做了什么
+## provider mismatch
 
-守护每轮做一次出口检测，按结果执行：
+旧版本可能把 `model_provider` 写成 `gptguard`。退出 Codex 后启动 v0.4.0，在窗口中点击“确认接管配置”。程序会优先从事务备份恢复原 provider 身份，再把本地网关地址写入 endpoint。当前文件被手动修改时，程序会先保存冲突备份并停止自动覆盖。
 
-| 结果 | 动作 |
-|---|---|
-| 白名单通过 | 删除 GPTGuard 的 hosts 段和防火墙规则 |
-| 出口不在白名单 | 写入 hosts 段、添加按 exe 的出站阻断规则、终止配置里的目标进程 |
-| 检测失败 | 与“不在白名单”相同，按失败处理 |
-| 防护关闭 | 删除 GPTGuard 的 hosts 段和防火墙规则 |
+## 严格保护
 
-hosts 段用固定标记包起来：
+严格保护开启后，以下情况都会停止 Codex 转发：
 
-```text
-# BEGIN GPTGuard egress block
-0.0.0.0 chatgpt.com
-::1 chatgpt.com
-...
-# END GPTGuard egress block
-```
+- 出口检测失败。
+- Mihomo 节点全部失效。
+- Mihomo 配置校验失败。
+- Codex 接管事务校验失败。
+- 本地网关或运行时组件异常。
 
-只改这一段，不动其他行。防火墙规则名是 `GPTGuard Block <目标名>`，按 `program=<exe 路径>` 阻断出站。规则不按域名解析，代理连接也会被覆盖。
+GPTGuard 不会在这些情况下自动选择直连。
 
-普通权限下，hosts 和防火墙会失败，状态变成 `error`，详情里带原因。进程终止不需要管理员权限，但只能终止当前用户有权限终止的进程。
+## 高级命令
 
-## 只允许本地代理
-
-`proxy_only = true` 时，守护始终给受保护的 exe 添加 Windows 防火墙出站阻断规则，不依赖当前出口检测结果。Windows 防火墙默认放行回环流量，所以程序仍能连接 `127.0.0.1:17841` 的 GPTGuard 网关，但无法直连外部。
+普通用户不需要命令行。开发者可以从安装目录运行：
 
 ```powershell
-gptguard set proxy-only true
-gptguard set network-guard true
-gptguard run
+GPTGuard.exe --cli status
+GPTGuard.exe --cli doctor
+GPTGuard.exe --cli codex status
+GPTGuard.exe --cli codex restore
 ```
 
-需要管理员权限。实测：
+`web` 命令、旧的 `gptguard-cli.exe` 和 CMD 启动脚本只用于旧版本兼容，不属于 v0.4.0 的主路径。
 
-- 外部 HTTPS 连接失败。
-- `127.0.0.1` 本地 HTTP 服务返回 200。
-- 停止守护后规则保留，程序继续被阻断。
-- 关闭防护后重启守护，规则删除。
+## 排障
 
-这个模式按 exe 路径匹配。复制 exe、改名、子进程不受同一条规则约束。需要覆盖子进程时，用独立 Windows 用户运行受保护程序，再按用户 SID 做防火墙或 WFP 策略。
+日志在 `%LOCALAPPDATA%\GPTGuard\logs\`。先在主界面点击“查看诊断”，再检查：
 
-## 自动更新锁定
+- Codex 配置是否存在。
+- 旧事务是否有完整备份。
+- 节点文件是否包含受支持的协议。
+- Windows 防火墙或安全软件是否阻止了 GPTGuard 或内置 Mihomo。
 
-`gptguard update-lock on` 做两件事：
-
-1. 在 hosts 写入 `# BEGIN GPTGuard update lock` 段，覆盖配置里的更新域名。
-2. 对配置里已存在的更新目录执行 `icacls <目录> /deny "<用户>:(OI)(CI)(W,D)"`。
-
-关闭时删除 hosts 段，并按 `update-lock.json` 记录逐个执行 `/remove:d`。
-
-默认域名：
-
-```text
-persistent.oaistatic.com
-cdn.oaistatic.com
-updates.chatgpt.com
-update.chatgpt.com
-```
-
-默认目录：
-
-```text
-%LOCALAPPDATA%\Programs\ChatGPT
-%LOCALAPPDATA%\ChatGPT
-%LOCALAPPDATA%\Programs\codex
-```
-
-目录不存在时跳过。升级路径变化后要改 `config.json` 的 `update_lock.paths`。这个功能没有禁用计划任务或服务，也不是不可绕过的更新隔离。
-
-## 固定模型
-
-```powershell
-gptguard model gpt-5.6-sol
-```
-
-命令做三件事：
-
-1. 把 `codex.fixed_model` 设为 `true`。
-2. 把 `codex.model` 设为指定模型。
-3. 如果 Codex 配置已接管，直接改已安装配置里的 `model`，并更新事务哈希。
-
-没有接管事务时只写本工具配置，下次 `codex takeover` 时再写入。
-
-ChatGPT 桌面端没有可从外部固定模型的接口，这个功能只对 Codex CLI 生效。
-
-## 托盘
-
-菜单项：
-
-- 状态：守护判定、HTTP 出口、Codex 接管状态。
-- 立即检测出口。
-- 打开设置面板。
-- 开关防护、更新锁、登录自启动。
-- 退出托盘，守护继续运行。
-
-双击托盘图标打开面板。退出托盘不会停止守护；停止守护用 `Ctrl+C` 结束 `gptguard run`，或在任务管理器结束对应进程。
-
-## 面板
-
-默认 `http://127.0.0.1:17842`。只监听回环地址，API 需要 `x-gptguard-token`。页面地址带 `#token=` 片段，JavaScript 读取后写入 `sessionStorage`，随后清掉地址栏片段。
-
-面板可以查看状态、改白名单、开关防护、接管/恢复 Codex、导入订阅、测试采集、开关更新锁和自启动、读日志。代理 URL 和凭据返回时打码。
-
-## 常见问题
-
-### 状态显示“执行层异常”
-
-看 `gptguard status` 或面板里的 `enforcement.errors`。常见原因：
-
-- 终端不是管理员，hosts 或防火墙写入失败。
-- 目标程序路径不存在，`netsh` 拒绝添加规则。
-- 防火墙服务被禁用。
-
-### Codex 返回 409 `codex_config_changed`
-
-接管后 `config.toml` 被其他工具改过。先退出 Codex，运行：
-
-```powershell
-gptguard codex status
-gptguard codex restore --force
-gptguard codex takeover --auth chatgpt
-```
-
-`--force` 会先把当前文件另存到备份目录，再写回接管前的内容。
-
-### Codex 返回 503 `state_unavailable`
-
-严格模式下没有采到合格 state。处理顺序：
-
-1. 面板里看采集诊断和冷却时间。
-2. 确认账号规则是个人还是 Team。
-3. 换一个出口，或先在面板里选普通转发兜底。
-4. 不要把“没有 state”当成网络错误反复重试。
-
-### Codex 返回 415
-
-请求体编码不是 gzip、zstd 或未压缩。确认 Codex 版本，并看面板日志里的编码错误。
-
-### Codex 返回 426
-
-请求使用了 WebSocket。当前只支持 HTTP/SSE。
-
-### 面板打不开
-
-看 `%LOCALAPPDATA%\GPTGuard\logs\` 最新日志。常见原因是端口 17842 被占用，或守护没有启动。改 `config.json` 的 `ui.web_port` 后重启守护。
-
-### 停止后仍然无法联网
-
-守护被强制结束时，hosts 段和防火墙规则可能还在。用管理员终端运行：
-
-```powershell
-gptguard set network-guard false
-gptguard run
-```
-
-等一轮检测通过，或手动删除 hosts 里的 GPTGuard 段和 `GPTGuard Block *` 防火墙规则。
-
-## 卸载
-
-```powershell
-gptguard autostart off
-gptguard update-lock off
-gptguard codex restore
-```
-
-停止守护和托盘，然后删除：
-
-```text
-%APPDATA%\GPTGuard
-%LOCALAPPDATA%\GPTGuard
-```
-
-Codex 原配置由 `codex restore` 恢复。备份目录里仍有历史副本，可自行保留。
+卸载前，GPTGuard 会尝试恢复 Codex 原配置。如果当前文件已经被手动改过，程序会保留现场并要求进入高级恢复。

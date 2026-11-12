@@ -52,11 +52,11 @@ mod imp {
             let menu = Menu::new();
             let status = MenuItem::new("状态：读取中", false, None);
             let check = MenuItem::new("立即检测出口", true, None);
-            let open = MenuItem::new("打开设置面板", true, None);
+            let open = MenuItem::new("打开 GPTGuard", true, None);
             let protection = MenuItem::new("开启 / 关闭防护", true, None);
             let update_lock = MenuItem::new("开启 / 关闭自动更新锁定", true, None);
             let autostart = MenuItem::new("开启 / 关闭登录自启动", true, None);
-            let exit = MenuItem::new("退出托盘（守护继续运行）", true, None);
+            let exit = MenuItem::new("退出 GPTGuard", true, None);
             menu.append_items(&[
                 &status,
                 &PredefinedMenuItem::separator(),
@@ -139,7 +139,7 @@ mod imp {
                 if event.id == check_id {
                     self.post("/api/check", serde_json::json!({}));
                 } else if event.id == open_id {
-                    let _ = util::open_url(&self.panel_url());
+                    let _ = util::spawn_detached(&util::exe_path(), &[]);
                 } else if event.id == protection_id {
                     self.toggle("/api/protection", "protection");
                 } else if event.id == update_id {
@@ -147,6 +147,7 @@ mod imp {
                 } else if event.id == autostart_id {
                     self.toggle("/api/autostart", "ui");
                 } else if event.id == exit_id {
+                    self.post_blocking("/api/shutdown", serde_json::json!({}));
                     event_loop.exit();
                 }
             }
@@ -155,13 +156,9 @@ mod imp {
         fn handle_tray_click(&mut self) {
             while let Ok(event) = TrayIconEvent::receiver().try_recv() {
                 if matches!(event, TrayIconEvent::DoubleClick { .. }) {
-                    let _ = util::open_url(&self.panel_url());
+                    let _ = util::spawn_detached(&util::exe_path(), &[]);
                 }
             }
-        }
-
-        fn panel_url(&self) -> String {
-            format!("http://127.0.0.1:{}/#token={}", self.port, self.token)
         }
 
         fn post(&self, path: &str, body: serde_json::Value) {
@@ -191,6 +188,29 @@ mod imp {
                         .await;
                     // The next tick refreshes from state.json.
                 });
+            });
+        }
+
+        fn post_blocking(&self, path: &str, body: serde_json::Value) {
+            let url = format!("http://127.0.0.1:{}{}", self.port, path);
+            let token = self.token.clone();
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            let _ = runtime.block_on(async move {
+                let client = reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(5))
+                    .build()?;
+                client
+                    .post(url)
+                    .header("x-gptguard-token", token)
+                    .json(&body)
+                    .send()
+                    .await
             });
         }
 
@@ -380,14 +400,9 @@ mod imp {
     }
 
     fn cli_path() -> std::path::PathBuf {
-        let exe = util::exe_path();
-        for name in ["gptguard-cli.exe", "gptguard.exe"] {
-            let candidate = exe.with_file_name(name);
-            if candidate.is_file() && candidate != exe {
-                return candidate;
-            }
-        }
-        exe
+        // v0.4.0 has one executable.  Never prefer an old side-by-side
+        // gptguard-cli.exe, which could reintroduce the legacy provider flow.
+        util::exe_path()
     }
 
     fn daemon_alive(paths: &AppPaths) -> bool {

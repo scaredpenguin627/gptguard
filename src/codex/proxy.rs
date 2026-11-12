@@ -5,6 +5,7 @@
 //! replays a generation request after an upstream response.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -39,6 +40,9 @@ struct Inner {
     paths: AppPaths,
     config: RwLock<Config>,
     routes: RwLock<Vec<Route>>,
+    sidecar: crate::mihomo::Runtime,
+    egress_allowed: AtomicBool,
+    egress_pid: AtomicU32,
     selection: RwLock<RuntimeSelection>,
     sessions: Mutex<HashMap<String, Arc<AsyncMutex<Session>>>>,
     limits: Mutex<HashMap<String, Arc<Mutex<Limit>>>>,
@@ -79,6 +83,8 @@ pub struct ProxyStatus {
     pub sessions: usize,
     pub requests: u64,
     pub detail: String,
+    #[serde(default)]
+    pub mihomo: crate::mihomo::SidecarStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,13 +97,17 @@ pub struct ProbeReport {
 
 impl ProxyRuntime {
     pub fn new(config: Config, paths: AppPaths) -> Result<Self> {
-        let routes = routes::build_routes(&config)?;
+        config.validate()?;
+        let (sidecar, routes) = crate::mihomo::Runtime::start(&config, &paths)?;
         let selection = load_selection(&config, &paths);
         Ok(Self {
             inner: Arc::new(Inner {
                 paths,
                 config: RwLock::new(config),
                 routes: RwLock::new(routes),
+                sidecar,
+                egress_allowed: AtomicBool::new(false),
+                egress_pid: AtomicU32::new(0),
                 selection: RwLock::new(selection),
                 sessions: Mutex::new(HashMap::new()),
                 limits: Mutex::new(HashMap::new()),
@@ -110,23 +120,103 @@ impl ProxyRuntime {
         self.inner.config.read().unwrap().codex.listen.clone()
     }
 
+    pub fn shutdown(&self) {
+        self.inner.sidecar.shutdown();
+    }
+
     pub fn reload(&self, config: Config) -> Result<()> {
-        let routes = routes::build_routes(&config)?;
+        config.validate()?;
+        self.check_reload(&config)?;
+        let routes = if config.mihomo.enabled {
+            self.inner.routes.read().unwrap().clone()
+        } else {
+            routes::build_routes(&config)?
+        };
         let selection = load_selection(&config, &self.inner.paths);
         *self.inner.routes.write().unwrap() = routes;
         *self.inner.selection.write().unwrap() = selection;
-        *self.inner.config.write().unwrap() = config;
+        let mut current = self.inner.config.write().unwrap();
+        if serde_json::to_value(&current.protection)? != serde_json::to_value(&config.protection)? {
+            self.inner.egress_allowed.store(false, Ordering::Release);
+        }
+        *current = config;
         Ok(())
+    }
+
+    pub fn check_reload(&self, config: &Config) -> Result<()> {
+        let old = self.inner.config.read().unwrap();
+        if (old.mihomo.enabled || config.mihomo.enabled)
+            && crate::mihomo::fingerprint(&old) != crate::mihomo::fingerprint(config)
+        {
+            bail!("修改 Mihomo 或节点前请先停止守护，保存配置后再启动");
+        }
+        Ok(())
+    }
+
+    pub async fn check_egress(&self, config: &Config) -> crate::ipcheck::IpReport {
+        if !config.mihomo.enabled {
+            return crate::ipcheck::check(config).await;
+        }
+        let routes = self.inner.routes.read().unwrap().clone();
+        let checked_pid = self.inner.sidecar.status().pid.unwrap_or(0);
+        if !self.inner.sidecar.available() || routes.is_empty() {
+            self.inner.egress_allowed.store(false, Ordering::Release);
+            return crate::ipcheck::IpReport {
+                mode: crate::config::IpCheckMode::Http,
+                http_ip: None,
+                stun_ip: None,
+                checked_at: util::now_iso(),
+                detected: false,
+                allowed: false,
+                detail: "Mihomo 未就绪，无法确认出口；按失败处理".into(),
+            };
+        }
+        let route_count = routes.len();
+        let configs: Vec<_> = routes
+            .into_iter()
+            .map(|route| {
+                let mut cfg = config.clone();
+                cfg.protection.http_proxy = route.url;
+                cfg
+            })
+            .collect();
+        let mut reports = futures_util::stream::iter(configs)
+            .map(|cfg| async move { crate::ipcheck::check(&cfg).await })
+            .buffered(8)
+            .collect::<Vec<_>>()
+            .await;
+        let detected = reports.iter().all(|r| r.detected);
+        // A completed check of an old whitelist cannot reopen a newly changed
+        // policy. Keep this read guard until publication; reload revokes under
+        // the corresponding write guard.
+        let current = self.inner.config.read().unwrap();
+        let allowed = self.inner.sidecar.available()
+            && self.inner.sidecar.status().pid == Some(checked_pid)
+            && serde_json::to_value(&current.protection).ok()
+                == serde_json::to_value(&config.protection).ok()
+            && reports.iter().all(|r| r.allowed);
+        self.inner.egress_pid.store(checked_pid, Ordering::Release);
+        self.inner.egress_allowed.store(allowed, Ordering::Release);
+        drop(current);
+        let mut report = reports.remove(0);
+        report.detected = detected;
+        report.allowed = allowed;
+        report.detail = if allowed {
+            format!("{route_count} 个 Mihomo 出口均在白名单内")
+        } else {
+            "至少一个 Mihomo 出口未通过检测；按失败处理".into()
+        };
+        report
     }
 
     pub fn status(&self) -> ProxyStatus {
         let config = self.inner.config.read().unwrap().clone();
         let selection = self.inner.selection.read().unwrap().clone();
-        let matches = if selection.owned {
-            config_tx::current_status(&config, &self.inner.paths).config_matches
-        } else {
-            true
-        };
+        // Without an active transaction Codex still points at its original
+        // upstream.  Report that as not ready so the native wizard keeps the
+        // takeover button enabled; only a verified transaction is a match.
+        let matches =
+            selection.owned && config_tx::current_status(&config, &self.inner.paths).config_matches;
         ProxyStatus {
             listen: config.codex.listen.clone(),
             upstream: provider::upstream_label(&Selection {
@@ -146,7 +236,10 @@ impl ProxyRuntime {
             routes: self.inner.routes.read().unwrap().len(),
             sessions: self.inner.sessions.lock().unwrap().len(),
             requests: *self.inner.requests.lock().unwrap(),
-            detail: if matches {
+            mihomo: self.inner.sidecar.status(),
+            detail: if !self.inner.sidecar.available() {
+                "Mihomo 未就绪；请求将返回 503".into()
+            } else if matches {
                 "转发服务运行中".into()
             } else {
                 "Codex 配置在接管后被修改；请求将返回 409".into()
@@ -181,6 +274,14 @@ impl ProxyRuntime {
     }
 
     pub async fn probe_now(&self) -> ProbeReport {
+        if !self.inner.sidecar.available() {
+            return ProbeReport {
+                ok: false,
+                route: None,
+                blocks: None,
+                detail: "Mihomo 未就绪".into(),
+            };
+        }
         let config = self.inner.config.read().unwrap().clone();
         let selection = self.inner.selection.read().unwrap().clone();
         let routes = self.inner.routes.read().unwrap().clone();
@@ -278,6 +379,28 @@ impl ProxyRuntime {
     }
 
     fn check_owned_config(&self) -> Result<(), Response> {
+        if !self.inner.sidecar.available() {
+            return Err(local_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "mihomo_unavailable",
+                "Mihomo 未就绪；已停止转发，不回退直连",
+            ));
+        }
+        let guarded = {
+            let config = self.inner.config.read().unwrap();
+            config.mihomo.enabled && config.protection.enabled
+        };
+        if guarded
+            && (!self.inner.egress_allowed.load(Ordering::Acquire)
+                || self.inner.sidecar.status().pid
+                    != Some(self.inner.egress_pid.load(Ordering::Acquire)))
+        {
+            return Err(local_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "egress_unverified",
+                "Mihomo 出口尚未全部通过白名单检测",
+            ));
+        }
         let selection = self.inner.selection.read().unwrap().clone();
         if !selection.owned {
             return Ok(());
@@ -532,7 +655,12 @@ async fn handle_generation(state: ProxyRuntime, request: Request<Body>, compact:
         );
     }
 
-    let session_key = hash_key(&format!("{credential_key}\u{0}{model}"));
+    let route_key = routes
+        .iter()
+        .map(|r| format!("{}:{:?}", r.id, r.url))
+        .collect::<Vec<_>>()
+        .join("\u{0}");
+    let session_key = hash_key(&format!("{credential_key}\u{0}{model}\u{0}{route_key}"));
     let session = get_session(
         &state,
         &session_key,
@@ -1243,5 +1371,24 @@ mod tests {
         assert!(runtime.check_local(&headers).is_ok());
         headers.insert(header::HOST, HeaderValue::from_static("evil.example:18741"));
         assert!(runtime.check_local(&headers).is_err());
+    }
+
+    #[test]
+    fn status_requires_a_takeover_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let paths = AppPaths {
+            config_dir: dir.path().join("c"),
+            data_dir: dir.path().join("d"),
+            config_file: dir.path().join("c/config.json"),
+            state_file: dir.path().join("d/state.json"),
+            log_dir: dir.path().join("d/logs"),
+            backups_dir: dir.path().join("d/backups"),
+            lock_file: dir.path().join("d/lock"),
+        };
+        let runtime = ProxyRuntime::new(config, paths).unwrap();
+        let status = runtime.status();
+        assert!(!status.owned);
+        assert!(!status.config_matches);
     }
 }

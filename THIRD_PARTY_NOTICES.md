@@ -23,6 +23,12 @@ ClaudeGuard 的 MIT 条款与 GPL-3.0 兼容。两个上游的 `LICENSE` 文件�
 
 再分发源代码或二进制时，请保留 `LICENSE`、本说明和 `Cargo.lock`，并遵守各依赖自带的许可证。
 
+## 内置的 Mihomo 运行时
+
+[MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo) 以独立 Go 进程运行，使用 GPL-3.0 许可证。Windows Release 构建从 [官方发布页](https://github.com/MetaCubeX/mihomo/releases) 下载锁定版本，校验 SHA-256 后把 `mihomo.exe` 嵌入 GPTGuard 安装器。首次启动时，GPTGuard 按哈希释放运行时并使用 Job Object 管理它。
+
+Mihomo 源码、许可证和版本信息见上游仓库。GPTGuard 不修改 Mihomo 源码，不把 Mihomo 命名放入产品名称，并在安装目录保留本说明。
+
 ## 参考实现
 
 - [storytold/craft-anything](https://github.com/storytold/craft-anything)：净室重建方法参考。本项目没有嵌入它的代码。

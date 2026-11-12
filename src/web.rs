@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::codex::config_tx;
 use crate::codex::provider;
 use crate::codex::routes;
-use crate::config::{parse_net, Config};
+use crate::config::{detect_local_proxy, parse_net, Config, RouteConfig};
 use crate::service::AppState;
 use crate::util;
 
@@ -50,6 +50,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/codex/restore", post(api_restore))
         .route("/api/codex/probe", post(api_probe))
         .route("/api/codex/subscription", post(api_subscription))
+        .route("/api/codex/import-file", post(api_import_file))
+        .route("/api/codex/auto-proxy", post(api_auto_proxy))
+        .route("/api/shutdown", post(api_shutdown))
         .route("/api/update-lock", post(api_update_lock))
         .route("/api/autostart", post(api_autostart))
         .with_state(state)
@@ -123,6 +126,8 @@ async fn api_status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         return response;
     }
     let cfg = state.config();
+    let legacy_provider = config_tx::legacy_repair_preview(&cfg, &state.paths).ok();
+    let takeover_preview = config_tx::takeover_preview(&cfg, &state.paths).ok();
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -133,7 +138,8 @@ async fn api_status(State(state): State<AppState>, headers: HeaderMap) -> Respon
             "doctor": state.doctor().into_iter().map(|(name, ok, detail)| serde_json::json!({
                 "name": name, "ok": ok, "detail": detail
             })).collect::<Vec<_>>(),
-            "panel_url": state.panel_url()
+            "legacy_provider": legacy_provider,
+            "takeover_preview": takeover_preview
         })),
     )
         .into_response()
@@ -169,9 +175,11 @@ fn config_view(cfg: &Config) -> serde_json::Value {
                 "id": route.id,
                 "label": route.label,
                 "url": util::mask_url(&route.url),
+                "type": route.mihomo.as_ref().and_then(|node| node.get("type")).and_then(|v| v.as_str()).unwrap_or("url"),
                 "enabled": route.enabled
             })).collect::<Vec<_>>(),
             "subscriptions": cfg.codex.subscriptions.len(),
+            "route_count": cfg.codex.routes.iter().filter(|route| route.enabled).count(),
         },
         "update_lock": {
             "enabled": cfg.update_lock.enabled,
@@ -459,6 +467,13 @@ struct SubscriptionBody {
     url: String,
 }
 
+#[derive(Deserialize)]
+struct FileImportBody {
+    content: String,
+    #[serde(default)]
+    name: String,
+}
+
 async fn api_subscription(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -468,12 +483,21 @@ async fn api_subscription(
         return response;
     }
     let mut cfg = state.config();
-    match routes::import_subscription(&mut cfg, &state.paths, body.url.trim()).await {
+    match routes::import_subscription(&mut cfg, body.url.trim()).await {
         Ok(result) => {
-            let _ = state.save_config(&cfg);
+            let restart_required = match save_or_restart(&state, &cfg) {
+                Ok(restart_required) => restart_required,
+                Err(err) => {
+                    return api_error(StatusCode::BAD_REQUEST, "save_failed", &format!("{err:#}"));
+                }
+            };
             (
                 StatusCode::OK,
-                Json(serde_json::json!({"ok": true, "import": result})),
+                Json(serde_json::json!({
+                    "ok": true,
+                    "import": result,
+                    "restart_required": restart_required
+                })),
             )
                 .into_response()
         }
@@ -483,6 +507,140 @@ async fn api_subscription(
             &format!("{err:#}"),
         ),
     }
+}
+
+fn save_or_restart(state: &AppState, cfg: &Config) -> anyhow::Result<bool> {
+    let before = state.config();
+    let mihomo_plan_changed = (before.mihomo.enabled || cfg.mihomo.enabled)
+        && crate::mihomo::fingerprint(&before) != crate::mihomo::fingerprint(cfg);
+    if mihomo_plan_changed {
+        // A running supervisor owns its child process and listener ports.  A
+        // native import writes the validated v2 config atomically, asks the
+        // daemon to exit, then starts the same EXE again with the new plan.
+        cfg.save(&state.paths)?;
+        state.request_shutdown();
+        Ok(true)
+    } else {
+        state.save_config(cfg)?;
+        Ok(false)
+    }
+}
+
+async fn api_import_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FileImportBody>,
+) -> Response {
+    if let Err(response) = authorized(&state, &headers) {
+        return response;
+    }
+    if body.content.len() > 4 * 1024 * 1024 {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file_too_large",
+            "节点文件超过 4 MiB",
+        );
+    }
+    let mut cfg = state.config();
+    let parsed = routes::parse_subscription(&body.content);
+    if parsed.routes.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "no_routes",
+            &format!(
+                "{} 中没有发现可用节点",
+                if body.name.is_empty() {
+                    "文件"
+                } else {
+                    &body.name
+                }
+            ),
+        );
+    }
+    routes::merge_routes(&mut cfg, parsed.routes);
+    cfg.codex.direct = false;
+    cfg.protection.ip_check_mode = crate::config::IpCheckMode::Http;
+    let restart_required = match save_or_restart(&state, &cfg) {
+        Ok(restart_required) => restart_required,
+        Err(err) => return api_error(StatusCode::BAD_REQUEST, "save_failed", &format!("{err:#}")),
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "import": parsed.result,
+            "restart_required": restart_required
+        })),
+    )
+        .into_response()
+}
+
+async fn api_auto_proxy(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorized(&state, &headers) {
+        return response;
+    }
+    let Some(proxy) = detect_local_proxy() else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "proxy_not_found",
+            "没有检测到本机代理",
+        );
+    };
+    let mut cfg = state.config();
+    let existing_proxy = cfg
+        .codex
+        .routes
+        .iter()
+        .any(|route| route.enabled && route.url == proxy);
+    if existing_proxy && cfg.mihomo.enabled {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "proxy": proxy, "changed": false})),
+        )
+            .into_response();
+    }
+    if !existing_proxy && (!cfg.codex.routes.is_empty() || !cfg.codex.direct) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "routes_already_configured",
+            "已有出口配置；请从向导中显式导入新的订阅",
+        );
+    }
+    if !existing_proxy {
+        cfg.codex.routes.push(RouteConfig {
+            id: "auto-local".into(),
+            label: "本机代理（自动检测）".into(),
+            url: proxy.clone(),
+            mihomo: None,
+            enabled: true,
+        });
+    }
+    cfg.codex.direct = false;
+    cfg.mihomo.enabled = true;
+    cfg.protection.ip_check_mode = crate::config::IpCheckMode::Http;
+    cfg.protection.http_proxy = Some(proxy.clone());
+    let restart_required = match save_or_restart(&state, &cfg) {
+        Ok(restart_required) => restart_required,
+        Err(err) => return api_error(StatusCode::BAD_REQUEST, "save_failed", &format!("{err:#}")),
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "proxy": proxy,
+            "changed": true,
+            "restart_required": restart_required
+        })),
+    )
+        .into_response()
+}
+
+async fn api_shutdown(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorized(&state, &headers) {
+        return response;
+    }
+    state.request_shutdown();
+    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
 #[derive(Deserialize)]
@@ -555,6 +713,10 @@ pub fn routes_map() -> HashMap<&'static str, &'static str> {
         ("POST", "/api/codex/takeover"),
         ("POST", "/api/codex/restore"),
         ("POST", "/api/codex/probe"),
+        ("POST", "/api/codex/subscription"),
+        ("POST", "/api/codex/import-file"),
+        ("POST", "/api/codex/auto-proxy"),
+        ("POST", "/api/shutdown"),
         ("POST", "/api/update-lock"),
         ("POST", "/api/autostart"),
     ])

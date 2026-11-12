@@ -1,3 +1,14 @@
+# 0.4.0（未发布）
+
+- 默认入口改为 Rust/Slint 原生桌面向导，不再打开浏览器面板。
+- 同一个 `GPTGuard.exe` 提供窗口、托盘、后台任务和隐藏 CLI，不再发布独立 `gptguard-cli.exe`。
+- Release 改为单文件 Windows x64 安装器，安装器内置并校验 Mihomo，不要求用户另行下载内核。
+- 首次启动自动检测本机代理，支持粘贴订阅或选择 YAML、URI、Base64 节点文件。
+- Mihomo 运行时按 SHA-256 释放到用户目录，继续使用回环监听、Job Object、就绪握手和失败关闭。
+- 配置从 v1 自动迁移到 v2；旧 `gptguard` provider 优先按事务备份恢复，避免 OpenAI 聊天出现 provider mismatch。
+- 接管 Codex 时保持原 provider 身份，只临时修改 `openai_base_url` 或原 provider 的 `base_url`。
+- 普通界面不展示管理端口、管理 token、命令行或 Mihomo 路径。
+
 # 0.3.0
 
 - 新增 `proxy_only` 系统级阻断：受保护 exe 始终只能访问回环代理，外部直连被 Windows 防火墙阻断。

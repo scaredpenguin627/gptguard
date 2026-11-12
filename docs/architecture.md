@@ -1,106 +1,42 @@
-# 架构说明
+# GPTGuard 架构
 
-## 进程与端口
-
-```text
-Codex CLI
-   │  HTTP/SSE (localhost)
-   ▼
-gptguard run ── 127.0.0.1:17841 ── Codex 网关
-   │
-   ├── 出口检测循环（HTTP + STUN）
-   ├── Windows 执行层（hosts / 防火墙 / 进程）
-   ├── 127.0.0.1:17842 ── 管理面板
-   └── state.json / logs / backups
-
-gptguard tray ── 读 state.json，调用 17842 API
-```
-
-一个守护进程，一个托盘客户端。托盘不持有执行层，关闭托盘不影响防护。
-
-## 代码分层
-
-| 模块 | 职责 |
-|---|---|
-| `src/config.rs` | 配置结构、路径、校验、CIDR、原子写 |
-| `src/ipcheck.rs` | HTTP 与 STUN 出口检测 |
-| `src/guard.rs` | hosts、防火墙、进程终止、更新锁、自启动 |
-| `src/codex/turnstate.rs` | state 解析、策略、active/ready 状态机 |
-| `src/codex/provider.rs` | Codex provider 解析、认证分类、33 块规则、JWT 提示 |
-| `src/codex/config_tx.rs` | `config.toml` 接管、备份、恢复、模型写入 |
-| `src/codex/routes.rs` | 出口客户端、订阅导入 |
-| `src/codex/proxy.rs` | Responses/SSE 网关、探测、注入、限流暂停 |
-| `src/service.rs` | 守护生命周期、检测循环、共享状态 |
-| `src/web.rs`、`web/index.html` | 本机面板与 API |
-| `src/tray.rs` | Windows 通知区 |
-| `src/cli.rs` | 命令行入口 |
-
-## 一次请求
+## 运行结构
 
 ```text
-Codex POST /backend-api/codex/responses
-  → Host / Origin 校验
-  → 解压 gzip/zstd，限制 64 MiB
-  → 读取 model；校准列表之外直接转发
-  → 按 Authorization + Account-Id + model 找会话
-  → 检查 401/403/429 暂停
-  → 取 state 快照；没有就探测
-  → 选择出口，注入 X-Codex-Turn-State
-  → 转发上游，流式回传
-  → 记录响应头 state 的观测结果
+GPTGuard.exe
+├── Slint 原生窗口与通知区
+├── Tokio 出口检测和 Codex 网关
+├── Codex 配置事务与 provider 迁移
+└── Mihomo 监督器
+    └── %LOCALAPPDATA%\GPTGuard\runtime\<hash>\mihomo.exe
 ```
 
-生成请求不会自动重放。响应 state 只影响后续请求的 active/ready 选择，不会直接覆盖当前 active。
+GPTGuard 是 Rust 主进程。Mihomo 仍作为独立子进程运行，所以 Go 内核不会进入 Rust 地址空间。内核文件由 Release 构建嵌入 EXE，首次启动时按哈希释放到当前用户目录。
 
-## state 状态机
+## 网络边界
 
-- `active`：当前使用的 state。
-- `ready`：备选，等 active 失效、接近续补窗口或连续两次观测异常后晋升。
-- `strikes`：同一 active 版本连续收到不符合规则的响应时累加。
-- `version`：每次发布递增，避免晚到的响应影响新 active。
-
-解析只检查：
-
-- Base64URL 解码成功。
-- 首字节为 `0x80`。
-- 时间戳在 2020–2100 之间。
-- `(len - 57) % 16 == 0`。
-- 块数在策略允许集合内。
-
-不验证密文，也不生成密文。
+- Codex 网关只绑定 `127.0.0.1`。
+- Mihomo 的每个混合入口只绑定 `127.0.0.1`。
+- Mihomo 配置关闭 TUN、DNS、外部控制器和 LAN 访问。
+- 节点退出、配置校验失败或出口检测失败时，网关返回 503。
+- 严格保护不补直连出口。
 
 ## 配置事务
 
-接管顺序：
+接管 Codex 前，GPTGuard 保存完整原文件、原始哈希、安装后哈希和 provider ID。
 
-1. 读取并解析 `config.toml`。
-2. 解析 provider 和认证方式。
-3. 备份原文件到 `%LOCALAPPDATA%\GPTGuard\backups\`。
-4. 用 `toml_edit` 写入 `model_provider = "gptguard"` 和 `[model_providers.gptguard]`。
-5. 记录原文件哈希、安装后哈希、上游、认证类型、profile。
-6. 原子替换。
+内置 `openai` provider 保持 `model_provider = "openai"`，只写入 `openai_base_url`。自定义 provider 保持原 ID，只临时替换自己的 `base_url`。旧版 `gptguard` provider 优先从事务备份恢复；当前文件变化时，先保存冲突副本。
 
-恢复时比较当前哈希与安装后哈希。不一致就拒绝，加 `--force` 时先把当前文件另存为冲突备份。网关每个请求检查事务与文件，发现不一致返回 409。
+## 用户界面
 
-## 安全边界
+主界面由 Slint 编译到 Rust。它通过本机管理 API 调用后台状态，但不打开浏览器，也不把管理端口展示给用户。旧管理 API 仅作为隐藏 CLI 和迁移兼容层保留。
 
-- 只监听回环地址。
-- 网关拒绝带 `Origin` 或 `Sec-Fetch-Site` 的请求，避免浏览器页面直接调用。
-- 面板要求 `x-gptguard-token`，并校验 Host 与 Origin。
-- 不读取 `auth.json`，不刷新 OAuth，不把凭据写到磁盘。
-- 日志不记录 Authorization、完整 state、订阅 URL 或代理凭据。
-- 中转 provider 清除 ChatGPT 专用头；官方 OAuth 凭据误发到中转时本地拒绝。
-- 401/403/429 暂停按凭据共享，切换模型不会重置。
-- 采集会消耗额度。没有可用 state 时，严格模式直接失败；兜底模式只转发一次。
+## 发布
 
-## 测试策略
+Windows x64 发布由 GitHub Actions 完成：
 
-单元测试覆盖纯逻辑：CIDR、hosts 段、state、provider、订阅、配置事务。
-
-集成测试在 `tests/proxy.rs` 启动本地 mock 上游，验证：
-
-- 辅助模型不被本地拒绝，请求体原样到达上游。
-- 33 块 state 能被采集并注入下一次生成。
-- SSE 响应能流式回传。
-
-没有真实账号的自动化测试。真实链路的验收要由使用者完成。
+1. 下载 `tools/mihomo.lock.json` 指定的官方 Mihomo 压缩包。
+2. 校验 SHA-256 并提取 `mihomo.exe`。
+3. 设置 `GPTGUARD_MIHOMO_PATH`，构建 GPTGuard。
+4. 使用 `installer/GPTGuard.iss` 生成单文件安装器。
+5. 检查发布目录只包含一个产品 EXE。

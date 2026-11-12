@@ -120,6 +120,7 @@ pub async fn check(config: &Config) -> IpReport {
 
 async fn check_http(proxy: Option<&str>) -> Result<IpAddr> {
     let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(8))
         .user_agent(concat!("GPTGuard/", env!("CARGO_PKG_VERSION")));
     if let Some(proxy) = proxy {

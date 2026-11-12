@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use crate::codex::proxy::{ProbeReport, ProxyRuntime, ProxyStatus};
 use crate::config::{AppPaths, Config};
 use crate::guard::{self, EnforcementReport, Verdict};
-use crate::ipcheck;
 use crate::util;
 use crate::web;
 
@@ -39,6 +38,9 @@ pub struct AppState {
     pub paths: AppPaths,
     pub runtime: Arc<RwLock<RuntimeState>>,
     pub proxy: ProxyRuntime,
+    /// Lets an internal configuration transaction restart the daemon after
+    /// replacing the generated Mihomo plan.
+    pub shutdown: Arc<tokio::sync::Notify>,
     pub started_at: String,
     /// Last applied block/allow decision and its report. Reapplying `netsh`
     /// every three seconds would churn firewall rules for no reason.
@@ -54,12 +56,8 @@ impl AppState {
         self.runtime.read().unwrap().clone()
     }
 
-    pub fn panel_url(&self) -> String {
-        let cfg = self.config();
-        format!("http://127.0.0.1:{}", cfg.ui.web_port)
-    }
-
     pub fn save_config(&self, cfg: &Config) -> Result<()> {
+        self.proxy.check_reload(cfg)?;
         cfg.save(&self.paths)?;
         *self.config.write().unwrap() = cfg.clone();
         self.proxy.reload(cfg.clone())?;
@@ -88,11 +86,6 @@ impl AppState {
             proxy.config_matches,
             format!("{} / {}", proxy.listen, proxy.detail),
         ));
-        rows.push((
-            "本地管理面板".into(),
-            true,
-            format!("http://127.0.0.1:{}", cfg.ui.web_port),
-        ));
         rows
     }
 
@@ -102,6 +95,10 @@ impl AppState {
 
     pub async fn probe_codex(&self) -> ProbeReport {
         self.proxy.probe_now().await
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown.notify_one();
     }
 }
 
@@ -145,11 +142,13 @@ pub async fn run(config: Config, paths: AppPaths, open_panel: bool) -> Result<()
         config_path: paths.config_file.display().to_string(),
         panel_url: panel_url.clone(),
     };
+    let shutdown = Arc::new(tokio::sync::Notify::new());
     let state = AppState {
         config: Arc::new(RwLock::new(cfg.clone())),
         paths: paths.clone(),
         runtime: Arc::new(RwLock::new(runtime)),
         proxy: proxy.clone(),
+        shutdown: shutdown.clone(),
         started_at,
         last_enforcement: Arc::new(std::sync::Mutex::new(None)),
     };
@@ -190,13 +189,21 @@ pub async fn run(config: Config, paths: AppPaths, open_panel: bool) -> Result<()
         let _ = util::open_url(&panel_url);
     }
 
-    tokio::signal::ctrl_c().await.context("wait Ctrl+C")?;
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("wait Ctrl+C")?;
+        }
+        _ = shutdown.notified() => {
+            util::info("shutdown requested by the native configuration flow");
+        }
+    }
     util::info("shutting down");
     let _ = proxy_tx.send(());
     let _ = web_tx.send(());
     guard_task.abort();
     proxy_task.abort();
     web_task.abort();
+    proxy.shutdown();
 
     // Do not leave a dead daemon's block behind. Update locking is separate and
     // remains until the user turns it off explicitly.
@@ -208,6 +215,7 @@ pub async fn run(config: Config, paths: AppPaths, open_panel: bool) -> Result<()
     }
     let mut state_now = state.runtime();
     state_now.status = Verdict::Stopped;
+    state_now.codex = proxy.status();
     state_now.detail = "守护已停止".into();
     *state.runtime.write().unwrap() = state_now.clone();
     state.write_state();
@@ -255,6 +263,8 @@ fn mark_disabled(state: &AppState, cfg: &Config) {
     }
     let mut runtime = state.runtime();
     runtime.status = Verdict::Disabled;
+    runtime.detected = false;
+    runtime.allowed = false;
     runtime.detail = "防护已关闭".into();
     runtime.checked_at = Some(util::now_iso());
     runtime.enforcement = EnforcementReport {
@@ -269,13 +279,16 @@ fn mark_disabled(state: &AppState, cfg: &Config) {
 
 async fn evaluate_once(state: &AppState, manual: bool) -> RuntimeState {
     let cfg = state.config();
-    if !cfg.protection.enabled {
+    if !cfg.protection.enabled && !manual {
         mark_disabled(state, &cfg);
         return state.runtime();
     }
     let started = std::time::Instant::now();
-    let report = ipcheck::check(&cfg).await;
-    let block = cfg.protection.proxy_only || !report.allowed;
+    let report = state.proxy.check_egress(&cfg).await;
+    // A manual wizard check is allowed to probe an exit before the user turns
+    // protection on, but it must never install a block while protection is
+    // disabled.  Background checks remain strict and fail closed.
+    let block = cfg.protection.enabled && (cfg.protection.proxy_only || !report.allowed);
     let enforcement = apply_enforcement(state, &cfg, block, manual);
     if cfg.protection.proxy_only && !report.allowed && cfg.protection.kill_on_block {
         // Keep the app from continuing with a direct connection while the
@@ -283,7 +296,15 @@ async fn evaluate_once(state: &AppState, manual: bool) -> RuntimeState {
         let killed = guard::target_paths(&cfg);
         let _ = util::kill_processes(&killed);
     }
-    let mut status = if report.allowed {
+    let mut status = if !cfg.protection.enabled {
+        if report.allowed {
+            Verdict::Allowed
+        } else if report.detected {
+            Verdict::Blocked
+        } else {
+            Verdict::Offline
+        }
+    } else if report.allowed {
         Verdict::Allowed
     } else if report.detected {
         Verdict::Blocked
@@ -348,6 +369,9 @@ pub fn read_state(paths: &AppPaths) -> Option<RuntimeState> {
     let mut state: RuntimeState = serde_json::from_str(&raw).ok()?;
     if !daemon_running(paths) {
         state.status = Verdict::Stopped;
+        state.codex.mihomo.ready = false;
+        state.codex.mihomo.pid = None;
+        state.codex.mihomo.detail = "守护未运行".into();
         state.detail = "守护未运行（状态文件来自已退出的进程）".into();
         state.http_ip = None;
         state.stun_ip = None;
