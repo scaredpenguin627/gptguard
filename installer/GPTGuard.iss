@@ -23,9 +23,6 @@ UninstallDisplayName={#AppName}
 CloseApplications=force
 RestartApplications=no
 
-[Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
-
 [Tasks]
 Name: "autostart"; Description: "登录 Windows 时启动 GPTGuard"; GroupDescription: "启动选项："
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式："
