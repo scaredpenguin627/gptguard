@@ -46,15 +46,25 @@ jobs:
         run: |
           $installer = (Get-ChildItem dist -File -Filter 'GPTGuard-Setup-v0.4.0-windows-x64.exe').FullName
           $installDir = Join-Path $env:RUNNER_TEMP 'GPTGuardSmoke'
+          $installLog = Join-Path $env:RUNNER_TEMP 'GPTGuardSmoke-install.log'
           if (Test-Path $installDir) { Remove-Item -Recurse -Force $installDir }
-          & $installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/DIR=$installDir"
-          if ($LASTEXITCODE -ne 0) { throw "installer exited with code $LASTEXITCODE" }
+          $install = Start-Process -FilePath $installer -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
+            "/DIR=$installDir", "/LOG=$installLog"
+          ) -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            if (Test-Path $installLog) { Get-Content $installLog -Tail 80 }
+            throw "installer exited with code $($install.ExitCode)"
+          }
           $app = Join-Path $installDir 'GPTGuard.exe'
           if (!(Test-Path $app)) { throw "installed GPTGuard.exe is missing" }
-          & $app --cli doctor
-          if ($LASTEXITCODE -ne 0) { throw "installed diagnostic exited with code $LASTEXITCODE" }
+          $doctor = Start-Process -FilePath $app -ArgumentList @('--cli', 'doctor') -Wait -PassThru -WindowStyle Hidden
+          if ($doctor.ExitCode -ne 0) { throw "installed diagnostic exited with code $($doctor.ExitCode)" }
           $uninstaller = Join-Path $installDir 'unins000.exe'
-          if (Test-Path $uninstaller) { & $uninstaller /VERYSILENT /SUPPRESSMSGBOXES /NORESTART }
+          if (Test-Path $uninstaller) {
+            $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+            if ($uninstall.ExitCode -ne 0) { throw "uninstaller exited with code $($uninstall.ExitCode)" }
+          }
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
