@@ -13,27 +13,6 @@ Release 页面只需要下载一个文件：`GPTGuard-Setup-v0.4.1-windows-x64.e
 5. 点击“立即检测”。检测通过后，查看 Codex 配置差异并点击“确认接管配置”。
 6. 点击“开启严格保护”。以后 GPTGuard 会在通知区运行。
 
-GPTGuard 会自动备份 Codex 配置。接管时保持原来的 provider 身份，不会把 `model_provider` 改成 `gptguard`。这能避免已有聊天出现“模型提供商不匹配”。
-
-窗口中不需要填写端口，也不需要打开浏览器。GPTGuard 和内置 Mihomo 只监听 `127.0.0.1`。
-
-## 旧版 provider mismatch 修复
-
-旧版 GPTGuard 曾经把 Codex 配置改成：
-
-```toml
-model_provider = "gptguard"
-```
-
-Codex 原来的聊天使用 `openai` provider 时，就会出现：
-
-```text
-模型提供商不匹配
-此聊天使用的是 OpenAI，但你当前的提供商是 gptguard。
-```
-
-升级到 v0.4.0 后，点击“确认接管配置”。GPTGuard 会优先使用旧事务的完整备份恢复 provider 身份，再把本机网关地址写到 `openai_base_url` 或原 provider 的 `base_url`。当前配置被手动改过时，GPTGuard 会先保存冲突副本，不会直接覆盖。
-
 ## 协议节点
 
 安装器已经内置 Mihomo。GPTGuard 会生成仅出站配置，关闭 TUN、DNS 和外部控制 API，并监督独立的 Mihomo 子进程。
