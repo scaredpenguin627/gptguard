@@ -2,7 +2,7 @@
 
 ## 普通用户
 
-1. 下载 Release 中唯一的 `GPTGuard-Setup-v0.4.0-windows-x64.exe`。
+1. 下载 Release 中唯一的 `GPTGuard-Setup-v0.4.1-windows-x64.exe`。
 2. 双击安装并启动 GPTGuard。
 3. 在原生窗口中完成代理检测、节点导入和 Codex 接管。
 4. 看到“已保护”后，可以关闭窗口。程序会留在通知区；从托盘退出会停止后台。
