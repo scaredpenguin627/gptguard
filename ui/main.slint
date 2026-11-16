@@ -1,4 +1,4 @@
-import { Button, CheckBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+import { Button, CheckBox, HorizontalBox, LineEdit, Palette, ScrollView, VerticalBox } from "std-widgets.slint";
 
 export component MainWindow inherits Window {
     title: "GPTGuard";
@@ -14,6 +14,12 @@ export component MainWindow inherits Window {
     in property <bool> setup_needed: true;
     in property <string> takeover_label: "确认接管配置";
     in-out property <string> subscription_text: "";
+
+    // The window surface is deliberately light. Keep standard widgets on the
+    // same palette when Windows itself is using dark mode.
+    init => {
+        Palette.color-scheme = ColorScheme.light;
+    }
 
     callback refresh_clicked();
     callback diagnostics_clicked();
@@ -69,6 +75,7 @@ export component MainWindow inherits Window {
                 padding: 20px;
                 spacing: 16px;
                 VerticalBox {
+                    horizontal-stretch: 1;
                     spacing: 5px;
                     Text {
                         text: root.status_text;
@@ -76,9 +83,12 @@ export component MainWindow inherits Window {
                         font-weight: 700;
                         color: #182033;
                     }
-                    Text { text: root.detail_text; color: #536078; }
+                    Text {
+                        text: root.detail_text;
+                        color: #536078;
+                        wrap: word-wrap;
+                    }
                 }
-                Rectangle { horizontal-stretch: 1; }
                 CheckBox {
                     text: root.protection_enabled ? "保护已开启" : "开启严格保护";
                     checked: root.protection_enabled;
