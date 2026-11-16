@@ -4,7 +4,7 @@ GPTGuard 是一个 Windows 出口保护工具。它把 Codex 的请求固定到�
 
 ## 小白怎么用
 
-Release 页面只需要下载一个文件：`GPTGuard-Setup-v0.4.0-windows-x64.exe`。
+Release 页面只需要下载一个文件：`GPTGuard-Setup-v0.4.1-windows-x64.exe`。
 
 1. 双击安装器。
 2. 启动 GPTGuard，等待它检测 Codex 和本机代理。
