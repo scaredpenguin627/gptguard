@@ -65,7 +65,10 @@ export component MainWindow inherits Window {
         }
 
         Rectangle {
-            height: 112px;
+            // Runtime diagnostics can contain several lines. Reserve enough
+            // room for them and scroll inside the card instead of letting the
+            // text paint over the cards below.
+            height: 180px;
             background: root.protection_enabled ? #e8f7ee : #fff4dc;
             border-radius: 14px;
             border-width: 1px;
@@ -83,10 +86,16 @@ export component MainWindow inherits Window {
                         font-weight: 700;
                         color: #182033;
                     }
-                    Text {
-                        text: root.detail_text;
-                        color: #536078;
-                        wrap: word-wrap;
+                    ScrollView {
+                        content-width: self.width;
+                        vertical-scrollbar-policy: as-needed;
+                        horizontal-scrollbar-policy: always-off;
+                        Text {
+                            width: parent.width;
+                            text: root.detail_text;
+                            color: #536078;
+                            wrap: word-wrap;
+                        }
                     }
                 }
                 CheckBox {

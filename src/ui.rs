@@ -54,7 +54,7 @@ pub fn run() -> Result<()> {
         window.on_about_clicked(move || {
             set_detail(
                 weak.clone(),
-                "GPTGuard v0.4.1 · 内置 Mihomo v1.19.34（GPL-3.0）\n源码：https://github.com/MetaCubeX/mihomo\nGPTGuard 只把 Mihomo 作为受监督的出站 sidecar，不开放局域网监听。".into(),
+                "GPTGuard v0.4.2 · 内置 Mihomo v1.19.34（GPL-3.0）\n源码：https://github.com/MetaCubeX/mihomo\nGPTGuard 只把 Mihomo 作为受监督的出站 sidecar，不开放局域网监听。".into(),
             );
         });
     }
