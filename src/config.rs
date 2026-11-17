@@ -4,13 +4,16 @@
 //! panel and the daemon all read exactly the same settings.
 
 use std::fs;
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use ipnet::IpNet;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+
+mod proxy_discovery;
+pub use proxy_discovery::discover_local_proxy;
 
 pub const APP_NAME: &str = "GPTGuard";
 pub const DISPLAY_NAME: &str = "GPTGuard";
@@ -657,67 +660,7 @@ pub fn validate_proxy_url(value: &str) -> Result<()> {
 /// uses this as a zero-configuration hint; it never changes the Windows
 /// system proxy and never exposes the port to the user.
 pub fn detect_local_proxy() -> Option<String> {
-    for key in ["GPTGUARD_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
-        if let Ok(value) = std::env::var(key) {
-            let value = value.trim();
-            if !value.is_empty() && validate_proxy_url(value).is_ok() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    #[cfg(windows)]
-    if let Some(proxy) = detect_windows_proxy() {
-        return Some(proxy);
-    }
-    for port in [7890u16, 7891, 1080, 10808, 20170] {
-        if TcpStream::connect_timeout(
-            &SocketAddr::from(([127, 0, 0, 1], port)),
-            std::time::Duration::from_millis(120),
-        )
-        .is_ok()
-        {
-            return Some(format!("http://127.0.0.1:{port}"));
-        }
-    }
-    None
-}
-
-#[cfg(windows)]
-fn detect_windows_proxy() -> Option<String> {
-    use winreg::enums::HKEY_CURRENT_USER;
-    use winreg::RegKey;
-
-    let key = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
-        .ok()?;
-    let enabled: u32 = key.get_value("ProxyEnable").ok()?;
-    if enabled == 0 {
-        return None;
-    }
-    let raw: String = key.get_value("ProxyServer").ok()?;
-    for entry in raw
-        .split(';')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-    {
-        let value = entry
-            .split_once('=')
-            .map(|(_, value)| value)
-            .unwrap_or(entry)
-            .trim();
-        if value.eq_ignore_ascii_case("<local>") {
-            continue;
-        }
-        let candidate = if value.contains("://") {
-            value.to_string()
-        } else {
-            format!("http://{value}")
-        };
-        if validate_proxy_url(&candidate).is_ok() {
-            return Some(candidate);
-        }
-    }
-    None
+    discover_local_proxy()
 }
 
 pub fn validate_upstream(value: &str) -> Result<()> {

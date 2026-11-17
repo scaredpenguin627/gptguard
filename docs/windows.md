@@ -2,16 +2,17 @@
 
 ## 普通用户
 
-1. 下载 Release 中唯一的 `GPTGuard-Setup-v0.4.2-windows-x64.exe`。
+1. 下载 Release 中唯一的 `GPTGuard-Setup-v0.4.3-windows-x64.exe`。
 2. 双击安装并启动 GPTGuard。
-3. 在原生窗口中完成代理检测、节点导入和 Codex 接管。
-4. 看到“已保护”后，可以关闭窗口。程序会留在通知区；从托盘退出会停止后台。
+3. 点击“一键连接 Clash Verge”。程序会扫描运行中的 Clash Verge / Mihomo，并做代理协议握手检查。
+4. 看到出口 IP 后确认“信任此出口”，再完成 Codex 接管。
+5. 看到“已保护”后，可以关闭窗口。程序会留在通知区；从托盘退出会停止后台。
 
 安装器不要求用户预先安装 Rust、Mihomo、PowerShell 脚本或浏览器面板。
 
 ## 首次启动没有代理
 
-点击“选择文件”，导入 YAML、URI 或 Base64 节点文件。也可以粘贴订阅地址。GPTGuard 会解析节点，生成自己的 Mihomo 配置，并关闭订阅中的规则、DNS、TUN 和外部监听设置。
+如果没有运行中的 Clash Verge，点击“选择文件”导入 YAML、URI 或 Base64 节点文件，也可以粘贴订阅地址。GPTGuard 会解析节点，生成自己的 Mihomo 配置，并关闭订阅中的规则、DNS、TUN 和外部监听设置。
 
 GPTGuard 只把 Mihomo 和 Codex 网关绑定到 `127.0.0.1`。端口由程序管理，用户无需填写。
 

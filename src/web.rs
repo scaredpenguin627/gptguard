@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::codex::config_tx;
 use crate::codex::provider;
 use crate::codex::routes;
-use crate::config::{detect_local_proxy, parse_net, Config, RouteConfig};
+use crate::config::{discover_local_proxy, parse_net, Config, RouteConfig};
 use crate::service::AppState;
 use crate::util;
 
@@ -51,6 +51,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/codex/probe", post(api_probe))
         .route("/api/codex/subscription", post(api_subscription))
         .route("/api/codex/import-file", post(api_import_file))
+        .route("/api/codex/connect-local", post(api_connect_local))
+        .route("/api/codex/trust-local-exit", post(api_trust_local_exit))
         .route("/api/codex/auto-proxy", post(api_auto_proxy))
         .route("/api/shutdown", post(api_shutdown))
         .route("/api/update-lock", post(api_update_lock))
@@ -579,12 +581,22 @@ async fn api_auto_proxy(State(state): State<AppState>, headers: HeaderMap) -> Re
     if let Err(response) = authorized(&state, &headers) {
         return response;
     }
-    let Some(proxy) = detect_local_proxy() else {
-        return api_error(
-            StatusCode::NOT_FOUND,
-            "proxy_not_found",
-            "没有检测到本机代理",
-        );
+    let proxy = match tokio::task::spawn_blocking(discover_local_proxy).await {
+        Ok(Some(proxy)) => proxy,
+        Ok(None) => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "proxy_not_found",
+                "没有检测到正在运行的 Clash Verge / Mihomo 代理",
+            )
+        }
+        Err(err) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "proxy_discovery_failed",
+                &format!("本机代理扫描失败: {err}"),
+            )
+        }
     };
     let mut cfg = state.config();
     let existing_proxy = cfg
@@ -631,6 +643,168 @@ async fn api_auto_proxy(State(state): State<AppState>, headers: HeaderMap) -> Re
             "changed": true,
             "restart_required": restart_required
         })),
+    )
+        .into_response()
+}
+
+/// Connect to a proxy already running on this machine. This endpoint is the
+/// explicit one-click path used by the native UI. It shares the same guarded
+/// discovery as the legacy auto-proxy endpoint, but never replaces a route or
+/// subscription that the user has already configured.
+async fn api_connect_local(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorized(&state, &headers) {
+        return response;
+    }
+    let proxy = match tokio::task::spawn_blocking(discover_local_proxy).await {
+        Ok(Some(proxy)) => proxy,
+        Ok(None) => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "proxy_not_found",
+                "没有检测到正在运行的 Clash Verge / Mihomo 代理",
+            )
+        }
+        Err(err) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "proxy_discovery_failed",
+                &format!("本机代理扫描失败: {err}"),
+            )
+        }
+    };
+    let mut cfg = state.config();
+    let auto_routes = cfg
+        .codex
+        .routes
+        .iter()
+        .filter(|route| route.id == "auto-local")
+        .count();
+    let has_explicit_routes = cfg
+        .codex
+        .routes
+        .iter()
+        .any(|route| route.enabled && route.id != "auto-local")
+        || !cfg.codex.subscriptions.is_empty();
+    if has_explicit_routes {
+        return api_error(
+            StatusCode::CONFLICT,
+            "routes_already_configured",
+            "已存在手动节点或订阅，请使用导入功能管理出口",
+        );
+    }
+    if auto_routes > 1 {
+        return api_error(
+            StatusCode::CONFLICT,
+            "duplicate_auto_route",
+            "检测到重复的本机代理配置，请先恢复原配置",
+        );
+    }
+    let changed = cfg.codex.direct
+        || cfg.mihomo.enabled == false
+        || cfg.protection.http_proxy.as_deref() != Some(proxy.as_str())
+        || cfg.codex.routes.first().map(|route| route.url.as_str()) != Some(proxy.as_str());
+    if auto_routes == 0 {
+        cfg.codex.routes.push(RouteConfig {
+            id: "auto-local".into(),
+            label: "Clash Verge 本机代理".into(),
+            url: proxy.clone(),
+            mihomo: None,
+            enabled: true,
+        });
+    } else if let Some(route) = cfg
+        .codex
+        .routes
+        .iter_mut()
+        .find(|route| route.id == "auto-local")
+    {
+        route.url = proxy.clone();
+        route.label = "Clash Verge 本机代理".into();
+        route.enabled = true;
+    }
+    cfg.codex.direct = false;
+    cfg.mihomo.enabled = true;
+    cfg.protection.ip_check_mode = crate::config::IpCheckMode::Http;
+    cfg.protection.http_proxy = Some(proxy.clone());
+    let restart_required = match save_or_restart(&state, &cfg) {
+        Ok(restart_required) => restart_required,
+        Err(err) => return api_error(StatusCode::BAD_REQUEST, "save_failed", &format!("{err:#}")),
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "proxy": proxy,
+            "changed": changed,
+            "restart_required": restart_required
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct TrustLocalExitBody {
+    ip: String,
+}
+
+async fn api_trust_local_exit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TrustLocalExitBody>,
+) -> Response {
+    if let Err(response) = authorized(&state, &headers) {
+        return response;
+    }
+    let Ok(ip) = body.ip.trim().parse::<std::net::IpAddr>() else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_exit_ip",
+            "出口 IP 格式不正确",
+        );
+    };
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_exit_ip",
+            "不能信任回环或特殊地址",
+        );
+    }
+    let mut cfg = state.config();
+    if !cfg.protection.whitelist.is_empty() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "whitelist_already_configured",
+            "出口白名单已经配置",
+        );
+    }
+    let enabled: Vec<_> = cfg
+        .codex
+        .routes
+        .iter()
+        .filter(|route| route.enabled)
+        .collect();
+    if enabled.len() != 1 || enabled[0].id != "auto-local" {
+        return api_error(
+            StatusCode::CONFLICT,
+            "local_route_required",
+            "只有唯一的 Clash Verge 本机出口可以执行此操作",
+        );
+    }
+    let proxy = enabled[0].url.clone();
+    let report = state.proxy.check_egress(&cfg).await;
+    if !report.detected || report.http_ip != Some(ip) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "exit_changed",
+            "重新检测到的出口 IP 已变化，请重新连接并确认",
+        );
+    }
+    cfg.protection.whitelist = vec![ip.to_string()];
+    if let Err(err) = state.save_config(&cfg) {
+        return api_error(StatusCode::BAD_REQUEST, "save_failed", &format!("{err:#}"));
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "ip": ip.to_string(), "proxy": proxy})),
     )
         .into_response()
 }
@@ -715,6 +889,8 @@ pub fn routes_map() -> HashMap<&'static str, &'static str> {
         ("POST", "/api/codex/probe"),
         ("POST", "/api/codex/subscription"),
         ("POST", "/api/codex/import-file"),
+        ("POST", "/api/codex/connect-local"),
+        ("POST", "/api/codex/trust-local-exit"),
         ("POST", "/api/codex/auto-proxy"),
         ("POST", "/api/shutdown"),
         ("POST", "/api/update-lock"),
