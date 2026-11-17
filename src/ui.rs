@@ -4,6 +4,7 @@
 //! the daemon and the hidden CLI, but the normal user path is this Rust/Slint
 //! window.  The UI never opens a browser and never exposes the internal ports.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +35,7 @@ pub fn run() -> Result<()> {
 
     let window = MainWindow::new().context("create native window")?;
     let shared = Arc::new(paths);
+    let operation_lock = Arc::new(std::sync::Mutex::new(()));
 
     {
         let paths = shared.clone();
@@ -54,8 +56,26 @@ pub fn run() -> Result<()> {
         window.on_about_clicked(move || {
             set_detail(
                 weak.clone(),
-                "GPTGuard v0.4.2 · 内置 Mihomo v1.19.34（GPL-3.0）\n源码：https://github.com/MetaCubeX/mihomo\nGPTGuard 只把 Mihomo 作为受监督的出站 sidecar，不开放局域网监听。".into(),
+                "GPTGuard v0.4.3 · 内置 Mihomo v1.19.34（GPL-3.0）\n源码：https://github.com/MetaCubeX/mihomo\nGPTGuard 只把 Mihomo 作为受监督的出站 sidecar，不开放局域网监听。".into(),
             );
+        });
+    }
+    {
+        let paths = shared.clone();
+        let weak = window.as_weak();
+        let lock = operation_lock.clone();
+        window.on_connect_local_clicked(move || {
+            set_operation_busy(weak.clone(), true);
+            connect_local_async(paths.clone(), weak.clone(), lock.clone());
+        });
+    }
+    {
+        let paths = shared.clone();
+        let weak = window.as_weak();
+        let lock = operation_lock.clone();
+        window.on_trust_local_exit_clicked(move |ip| {
+            set_operation_busy(weak.clone(), true);
+            trust_local_exit_async(paths.clone(), weak.clone(), lock.clone(), ip.to_string());
         });
     }
     {
@@ -188,13 +208,22 @@ pub fn run() -> Result<()> {
     {
         let paths = shared.clone();
         let weak = window.as_weak();
+        let lock = operation_lock.clone();
+        set_operation_busy(weak.clone(), true);
         std::thread::spawn(move || {
+            let _guard = lock.lock().ok();
             // This is intentionally idempotent: an existing explicit route or
             // imported subscription always wins over auto-detection.
             if let Ok(value) = post_api(&paths, "/api/codex/auto-proxy", serde_json::json!({})) {
                 let _ = restart_if_requested(&paths, &value);
             }
-            refresh_async(paths, weak);
+            match fetch_status(&paths) {
+                Ok(value) => {
+                    apply_snapshot(&weak, &value, false, None);
+                }
+                Err(err) => set_detail(weak.clone(), format!("后台尚未就绪：{err:#}")),
+            }
+            set_operation_busy(weak, false);
         });
     }
     window.run().context("run native window")?;
@@ -240,9 +269,23 @@ fn restart_daemon(paths: &AppPaths) -> Result<()> {
 }
 
 fn refresh_async(paths: Arc<AppPaths>, weak: slint::Weak<MainWindow>) {
+    refresh_async_mode(paths, weak, false, None);
+}
+
+fn refresh_async_mode(
+    paths: Arc<AppPaths>,
+    weak: slint::Weak<MainWindow>,
+    allow_trust_candidate: bool,
+    expected_proxy: Option<String>,
+) {
     std::thread::spawn(move || {
         let message = match fetch_status(&paths) {
-            Ok(value) => apply_snapshot(&weak, &value),
+            Ok(value) => apply_snapshot(
+                &weak,
+                &value,
+                allow_trust_candidate,
+                expected_proxy.as_deref(),
+            ),
             Err(err) => {
                 set_detail(weak, format!("后台尚未就绪：{err:#}"));
                 return;
@@ -251,6 +294,72 @@ fn refresh_async(paths: Arc<AppPaths>, weak: slint::Weak<MainWindow>) {
         if !message.is_empty() {
             set_detail(weak, message);
         }
+    });
+}
+
+fn connect_local_async(
+    paths: Arc<AppPaths>,
+    weak: slint::Weak<MainWindow>,
+    lock: Arc<std::sync::Mutex<()>>,
+) {
+    std::thread::spawn(move || {
+        let _guard = lock.lock().ok();
+        let result = post_api(&paths, "/api/codex/connect-local", serde_json::json!({})).and_then(
+            |response| {
+                let proxy = response["proxy"].as_str().unwrap_or_default().to_string();
+                if proxy.is_empty() {
+                    anyhow::bail!("后台没有返回本机代理地址")
+                }
+                restart_if_requested(&paths, &response)?;
+                let check = post_api(&paths, "/api/check", serde_json::json!({}))?;
+                let status = fetch_status(&paths)?;
+                Ok((proxy, check, status))
+            },
+        );
+        match result {
+            Ok((proxy, check, status)) => {
+                apply_snapshot(&weak, &status, true, Some(&proxy));
+                let detail = check["runtime"]["detail"]
+                    .as_str()
+                    .unwrap_or("本机代理检测完成");
+                set_detail(weak.clone(), format!("已连接 {proxy}；实际检测：{detail}"));
+            }
+            Err(err) => set_detail(weak.clone(), format!("一键连接失败：{err:#}")),
+        }
+        set_operation_busy(weak, false);
+    });
+}
+
+fn trust_local_exit_async(
+    paths: Arc<AppPaths>,
+    weak: slint::Weak<MainWindow>,
+    lock: Arc<std::sync::Mutex<()>>,
+    ip: String,
+) {
+    std::thread::spawn(move || {
+        let _guard = lock.lock().ok();
+        let result = post_api(
+            &paths,
+            "/api/codex/trust-local-exit",
+            serde_json::json!({"ip": ip}),
+        )
+        .and_then(|response| {
+            restart_if_requested(&paths, &response)?;
+            let check = post_api(&paths, "/api/check", serde_json::json!({}))?;
+            let status = fetch_status(&paths)?;
+            Ok((check, status))
+        });
+        match result {
+            Ok((check, status)) => {
+                apply_snapshot(&weak, &status, false, None);
+                let detail = check["runtime"]["detail"]
+                    .as_str()
+                    .unwrap_or("出口信任已更新");
+                set_detail(weak.clone(), format!("已信任出口；实际检测：{detail}"));
+            }
+            Err(err) => set_detail(weak.clone(), format!("信任出口失败：{err:#}")),
+        }
+        set_operation_busy(weak, false);
     });
 }
 
@@ -287,6 +396,18 @@ fn update_window(weak: slint::Weak<MainWindow>, message: String, paths: Arc<AppP
     refresh_async(paths, weak);
 }
 
+fn set_operation_busy(weak: slint::Weak<MainWindow>, busy: bool) {
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_operation_busy(busy);
+            if busy {
+                window.set_trust_candidate_visible(false);
+                window.set_trust_candidate_ip("".into());
+            }
+        }
+    });
+}
+
 fn set_detail(weak: slint::Weak<MainWindow>, message: String) {
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = weak.upgrade() {
@@ -295,7 +416,12 @@ fn set_detail(weak: slint::Weak<MainWindow>, message: String) {
     });
 }
 
-fn apply_snapshot(weak: &slint::Weak<MainWindow>, value: &Value) -> String {
+fn apply_snapshot(
+    weak: &slint::Weak<MainWindow>,
+    value: &Value,
+    allow_trust_candidate: bool,
+    expected_proxy: Option<&str>,
+) -> String {
     let runtime = &value["runtime"];
     let status = runtime["status"].as_str().unwrap_or("unknown");
     let detail = runtime["detail"].as_str().unwrap_or("后台已启动");
@@ -356,6 +482,11 @@ fn apply_snapshot(weak: &slint::Weak<MainWindow>, value: &Value) -> String {
             format!("待确认的 Codex 配置差异：{changes}")
         }
     };
+    let trust_candidate_ip = if allow_trust_candidate {
+        trust_candidate_ip(value, expected_proxy).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop({
         let status_text = status_text.to_string();
@@ -367,6 +498,7 @@ fn apply_snapshot(weak: &slint::Weak<MainWindow>, value: &Value) -> String {
         } else {
             "确认接管配置"
         };
+        let trust_candidate_ip = trust_candidate_ip.clone();
         move || {
             if let Some(window) = weak.upgrade() {
                 window.set_status_text(status_text.into());
@@ -376,10 +508,41 @@ fn apply_snapshot(weak: &slint::Weak<MainWindow>, value: &Value) -> String {
                 window.set_protection_enabled(protection);
                 window.set_setup_needed(setup_needed);
                 window.set_takeover_label(takeover_label.into());
+                window.set_trust_candidate_visible(!trust_candidate_ip.is_empty());
+                window.set_trust_candidate_ip(trust_candidate_ip.into());
             }
         }
     });
     String::new()
+}
+
+fn trust_candidate_ip(value: &Value, expected_proxy: Option<&str>) -> Option<String> {
+    let expected_proxy = expected_proxy?;
+    if !value["config"]["protection"]["whitelist"]
+        .as_array()
+        .is_some_and(|entries| entries.is_empty())
+    {
+        return None;
+    }
+    if !value["runtime"]["detected"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    let ip = value["runtime"]["http_ip"]
+        .as_str()?
+        .parse::<IpAddr>()
+        .ok()?;
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    let routes = value["config"]["codex"]["routes"].as_array()?;
+    let enabled = routes
+        .iter()
+        .filter(|route| route["enabled"].as_bool().unwrap_or(false))
+        .collect::<Vec<_>>();
+    if enabled.len() != 1 || enabled[0]["url"].as_str()? != expected_proxy {
+        return None;
+    }
+    Some(ip.to_string())
 }
 
 fn fetch_status(paths: &AppPaths) -> Result<Value> {
@@ -426,9 +589,15 @@ fn post_api(paths: &AppPaths, endpoint: &str, body: Value) -> Result<Value> {
             .json(&body)
             .send()
             .await?;
-        if !response.status().is_success() {
-            anyhow::bail!("后台返回 HTTP {}", response.status());
+        let status = response.status();
+        let body = response.text().await?;
+        let value: Value = serde_json::from_str(&body).context("解析后台响应")?;
+        if !status.is_success() {
+            let message = value["error"]["message"]
+                .as_str()
+                .unwrap_or("后台拒绝了请求");
+            anyhow::bail!("后台返回 HTTP {}：{message}", status);
         }
-        Ok(response.json().await?)
+        Ok(value)
     })
 }

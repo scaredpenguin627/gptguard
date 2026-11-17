@@ -12,6 +12,9 @@ export component MainWindow inherits Window {
     in property <string> codex_text: "正在检测 Codex 配置";
     in property <bool> protection_enabled: false;
     in property <bool> setup_needed: true;
+    in property <bool> operation_busy: false;
+    in property <bool> trust_candidate_visible: false;
+    in property <string> trust_candidate_ip: "";
     in property <string> takeover_label: "确认接管配置";
     in-out property <string> subscription_text: "";
 
@@ -24,6 +27,8 @@ export component MainWindow inherits Window {
     callback refresh_clicked();
     callback diagnostics_clicked();
     callback about_clicked();
+    callback connect_local_clicked();
+    callback trust_local_exit_clicked(string);
     callback import_clicked(string);
     callback file_clicked();
     callback takeover_clicked();
@@ -119,15 +124,28 @@ export component MainWindow inherits Window {
                     spacing: 10px;
                     Text { text: "出口"; font-size: 18px; font-weight: 700; color: #182033; }
                     Text { text: root.route_text; color: #536078; wrap: word-wrap; }
+                    Button {
+                        text: root.operation_busy ? "正在连接…" : "一键连接 Clash Verge";
+                        primary: true;
+                        enabled: !root.operation_busy;
+                        clicked => { root.connect_local_clicked(); }
+                    }
                     LineEdit {
                         placeholder-text: "粘贴订阅地址（可选）";
                         text <=> root.subscription_text;
+                        enabled: !root.operation_busy;
                     }
                     HorizontalBox {
                         spacing: 8px;
-                        Button { text: "导入并检测"; clicked => { root.import_clicked(root.subscription_text); } }
-                        Button { text: "选择文件"; clicked => { root.file_clicked(); } }
-                        Button { text: "刷新状态"; clicked => { root.refresh_clicked(); } }
+                        Button {
+                            visible: root.trust_candidate_visible;
+                            text: "信任出口 " + root.trust_candidate_ip;
+                            enabled: !root.operation_busy;
+                            clicked => { root.trust_local_exit_clicked(root.trust_candidate_ip); }
+                        }
+                        Button { text: "导入并检测"; enabled: !root.operation_busy; clicked => { root.import_clicked(root.subscription_text); } }
+                        Button { text: "选择文件"; enabled: !root.operation_busy; clicked => { root.file_clicked(); } }
+                        Button { text: "刷新状态"; enabled: !root.operation_busy; clicked => { root.refresh_clicked(); } }
                     }
                 }
             }
@@ -161,7 +179,7 @@ export component MainWindow inherits Window {
                     spacing: 8px;
                     Text { text: "使用说明"; font-size: 18px; font-weight: 700; color: #182033; }
                     Text {
-                        text: "首次使用：先导入订阅或复用本机代理，再点击“立即检测”。检测通过后，确认 Codex 配置差异并开启严格保护。节点退出、出口失配或内核损坏时，GPTGuard 会停止转发，不会自动走直连。";
+                        text: "首次使用：先点击“一键连接 Clash Verge”；连接不到本机代理时，再粘贴订阅或选择节点文件。连接后会进行真实出口检测，确认 Codex 配置差异后再开启严格保护。节点退出、出口失配或内核损坏时，GPTGuard 会停止转发，不会自动走直连。";
                         color: #536078;
                         wrap: word-wrap;
                     }
