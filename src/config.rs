@@ -448,6 +448,13 @@ impl Config {
                 .with_context(|| format!("read {}", paths.config_file.display()))?;
             let mut cfg: Config = serde_json::from_str(&raw)
                 .with_context(|| format!("parse {}", paths.config_file.display()))?;
+            // Older builds allowed strict protection to remain enabled with
+            // an empty whitelist. That state can only block every request and
+            // leaves the first-run flow stuck before an exit can be trusted.
+            if cfg.protection.enabled && cfg.protection.whitelist.is_empty() {
+                cfg.protection.enabled = false;
+                cfg.save(paths)?;
+            }
             if cfg.version == 1 {
                 // v0.3/v0.4 stored the same runtime model but exposed the
                 // browser panel and a user-supplied Mihomo executable.  Keep

@@ -220,6 +220,13 @@ async fn api_protection(
     if let Err(response) = authorized(&state, &headers) {
         return response;
     }
+    if body.enabled && state.config().protection.whitelist.is_empty() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "whitelist_required",
+            "请先连接并确认一个出口 IP，再开启严格保护",
+        );
+    }
     let mut cfg = state.config();
     cfg.protection.enabled = body.enabled;
     if let Err(err) = state.save_config(&cfg) {
@@ -604,7 +611,7 @@ async fn api_auto_proxy(State(state): State<AppState>, headers: HeaderMap) -> Re
         .routes
         .iter()
         .any(|route| route.enabled && route.url == proxy);
-    if existing_proxy && cfg.mihomo.enabled {
+    if existing_proxy && !cfg.mihomo.enabled {
         return (
             StatusCode::OK,
             Json(serde_json::json!({"ok": true, "proxy": proxy, "changed": false})),
@@ -628,7 +635,10 @@ async fn api_auto_proxy(State(state): State<AppState>, headers: HeaderMap) -> Re
         });
     }
     cfg.codex.direct = false;
-    cfg.mihomo.enabled = true;
+    // A local Clash Verge proxy is already a complete outbound route. Keep
+    // it as the direct route for the relay instead of adding a second
+    // embedded Mihomo hop. Imported subscriptions still use the sidecar.
+    cfg.mihomo.enabled = false;
     cfg.protection.ip_check_mode = crate::config::IpCheckMode::Http;
     cfg.protection.http_proxy = Some(proxy.clone());
     let restart_required = match save_or_restart(&state, &cfg) {
@@ -722,7 +732,7 @@ async fn api_connect_local(State(state): State<AppState>, headers: HeaderMap) ->
         route.enabled = true;
     }
     cfg.codex.direct = false;
-    cfg.mihomo.enabled = true;
+    cfg.mihomo.enabled = false;
     cfg.protection.ip_check_mode = crate::config::IpCheckMode::Http;
     cfg.protection.http_proxy = Some(proxy.clone());
     let restart_required = match save_or_restart(&state, &cfg) {
