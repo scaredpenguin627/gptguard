@@ -56,7 +56,7 @@ pub fn run() -> Result<()> {
         window.on_about_clicked(move || {
             set_detail(
                 weak.clone(),
-                "GPTGuard v0.4.3 · 内置 Mihomo v1.19.34（GPL-3.0）\n源码：https://github.com/MetaCubeX/mihomo\nGPTGuard 只把 Mihomo 作为受监督的出站 sidecar，不开放局域网监听。".into(),
+                "GPTGuard v0.4.4 · 内置 Mihomo v1.19.34（GPL-3.0）\n源码：https://github.com/MetaCubeX/mihomo\nGPTGuard 只把 Mihomo 作为受监督的出站 sidecar，不开放局域网监听。".into(),
             );
         });
     }
@@ -170,12 +170,19 @@ pub fn run() -> Result<()> {
             let weak = weak.clone();
             let paths = paths.clone();
             std::thread::spawn(move || {
-                let result = post_api(&paths, "/api/codex/restore", serde_json::json!({}));
-                let message = match result {
-                    Ok(_) => "Codex 原配置已恢复".to_string(),
-                    Err(err) => format!("恢复失败：{err:#}"),
-                };
-                set_detail(weak, message);
+                let result = post_api(
+                    &paths,
+                    "/api/codex/restore",
+                    serde_json::json!({"force": true}),
+                );
+                match result {
+                    Ok(_) => update_window(
+                        weak,
+                        "Codex 原配置已恢复，当前文件已另存为冲突备份".to_string(),
+                        paths,
+                    ),
+                    Err(err) => set_detail(weak, format!("恢复失败：{err:#}")),
+                }
             });
         });
     }

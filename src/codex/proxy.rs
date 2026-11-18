@@ -237,7 +237,13 @@ impl ProxyRuntime {
             sessions: self.inner.sessions.lock().unwrap().len(),
             requests: *self.inner.requests.lock().unwrap(),
             mihomo: self.inner.sidecar.status(),
-            detail: if !self.inner.sidecar.available() {
+            detail: if !config.mihomo.enabled {
+                if matches {
+                    "本机代理已连接，转发服务运行中".into()
+                } else {
+                    "本机代理已连接，Codex 尚未接管".into()
+                }
+            } else if !self.inner.sidecar.available() {
                 "Mihomo 未就绪；请求将返回 503".into()
             } else if matches {
                 "转发服务运行中".into()

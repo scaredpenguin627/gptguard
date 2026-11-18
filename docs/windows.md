@@ -2,7 +2,7 @@
 
 ## 普通用户
 
-1. 下载 Release 中唯一的 `GPTGuard-Setup-v0.4.3-windows-x64.exe`。
+1. 下载 Release 中唯一的 `GPTGuard-Setup-v0.4.4-windows-x64.exe`。
 2. 双击安装并启动 GPTGuard。
 3. 点击“一键连接 Clash Verge”。程序会扫描运行中的 Clash Verge / Mihomo，并做代理协议握手检查。
 4. 看到出口 IP 后确认“信任此出口”，再完成 Codex 接管。

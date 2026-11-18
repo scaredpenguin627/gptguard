@@ -2,8 +2,11 @@ import { Button, CheckBox, HorizontalBox, LineEdit, Palette, ScrollView, Vertica
 
 export component MainWindow inherits Window {
     title: "GPTGuard";
+    // Give the guidance card enough room to stay readable on the first run.
+    // The previous 620px window left only a narrow strip visible after the
+    // status and action cards grew to accommodate diagnostics.
     width: 920px;
-    height: 620px;
+    height: 720px;
     background: #f6f7fb;
 
     in property <string> status_text: "正在启动";
@@ -74,10 +77,13 @@ export component MainWindow inherits Window {
             // room for them and scroll inside the card instead of letting the
             // text paint over the cards below.
             height: 180px;
-            background: root.protection_enabled ? #e8f7ee : #fff4dc;
+            // A failed check must be visually distinct from a healthy
+            // protected state. The old card stayed green whenever the
+            // checkbox was on, even while the status said "已阻断".
+            background: root.status_text == "已阻断" ? #fff0f0 : root.protection_enabled ? #e8f7ee : #fff4dc;
             border-radius: 14px;
             border-width: 1px;
-            border-color: root.protection_enabled ? #b6e3c7 : #f0d18a;
+            border-color: root.status_text == "已阻断" ? #efb4b4 : root.protection_enabled ? #b6e3c7 : #f0d18a;
 
             HorizontalBox {
                 padding: 20px;
@@ -104,7 +110,7 @@ export component MainWindow inherits Window {
                     }
                 }
                 CheckBox {
-                    text: root.protection_enabled ? "保护已开启" : "开启严格保护";
+                    text: root.protection_enabled ? (root.status_text == "已阻断" ? "保护已开启 · 出口已阻断" : "保护已开启") : "开启严格保护";
                     checked: root.protection_enabled;
                     toggled => { root.protection_clicked(self.checked); }
                 }
@@ -135,14 +141,17 @@ export component MainWindow inherits Window {
                         text <=> root.subscription_text;
                         enabled: !root.operation_busy;
                     }
+                    // Keep the trust action on its own row. Four buttons in a
+                    // single row overflow the export card on a narrow window.
+                    Button {
+                        visible: root.trust_candidate_visible;
+                        text: "信任出口 " + root.trust_candidate_ip;
+                        primary: true;
+                        enabled: !root.operation_busy;
+                        clicked => { root.trust_local_exit_clicked(root.trust_candidate_ip); }
+                    }
                     HorizontalBox {
                         spacing: 8px;
-                        Button {
-                            visible: root.trust_candidate_visible;
-                            text: "信任出口 " + root.trust_candidate_ip;
-                            enabled: !root.operation_busy;
-                            clicked => { root.trust_local_exit_clicked(root.trust_candidate_ip); }
-                        }
                         Button { text: "导入并检测"; enabled: !root.operation_busy; clicked => { root.import_clicked(root.subscription_text); } }
                         Button { text: "选择文件"; enabled: !root.operation_busy; clicked => { root.file_clicked(); } }
                         Button { text: "刷新状态"; enabled: !root.operation_busy; clicked => { root.refresh_clicked(); } }
@@ -161,7 +170,7 @@ export component MainWindow inherits Window {
                     Text { text: "Codex"; font-size: 18px; font-weight: 700; color: #182033; }
                     Text { text: root.codex_text; color: #536078; wrap: word-wrap; }
                     Button { text: root.takeover_label; enabled: root.setup_needed; clicked => { root.takeover_clicked(); } }
-                    Button { text: "恢复原配置"; clicked => { root.restore_clicked(); } }
+                    Button { text: "恢复原配置（保留冲突副本）"; clicked => { root.restore_clicked(); } }
                 }
             }
         }

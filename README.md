@@ -4,7 +4,7 @@ GPTGuard 是一个 Windows 出口保护工具。它把 Codex 的请求固定到�
 
 ## 小白怎么用
 
-Release 页面只需要下载一个文件：`GPTGuard-Setup-v0.4.3-windows-x64.exe`。
+Release 页面只需要下载一个文件：`GPTGuard-Setup-v0.4.4-windows-x64.exe`。
 
 1. 双击安装器。
 2. 启动 GPTGuard，点击“一键连接 Clash Verge”。GPTGuard 会扫描正在运行的 Clash Verge / Mihomo，并验证代理握手。
