@@ -2,17 +2,17 @@
 
 ## 普通用户
 
-1. 下载 Release 中唯一的 `GPTGuard-Setup-v0.4.4-windows-x64.exe`。
-2. 双击安装并启动 GPTGuard。
-3. 点击“一键连接 Clash Verge”。程序会扫描运行中的 Clash Verge / Mihomo，并做代理协议握手检查。
-4. 看到出口 IP 后确认“信任此出口”，再完成 Codex 接管。
-5. 看到“已保护”后，可以关闭窗口。程序会留在通知区；从托盘退出会停止后台。
+1. 从 Release 下载 `GPTGuard-Setup-v0.4.5-windows-x64.exe`，双击安装。
+2. 在 Clash Verge 选好节点，右键 GPTGuard 并选择“以管理员身份运行”。
+3. 点击“开启严格保护”。首次使用时，GPTGuard 自动查找本机代理并检测出口 IP。
+4. 核对 IP 后点击“信任并开启保护”。如果复测时 IP 发生变化，选择稳定的节点，再点击“开启严格保护”。
+5. 在“Codex 网关”查看改动，点击“确认接管配置”。看到“已保护”后可以关闭窗口，后台会留在通知区运行。
 
 安装器不要求用户预先安装 Rust、Mihomo、PowerShell 脚本或浏览器面板。
 
 ## 首次启动没有代理
 
-如果没有运行中的 Clash Verge，点击“选择文件”导入 YAML、URI 或 Base64 节点文件，也可以粘贴订阅地址。GPTGuard 会解析节点，生成自己的 Mihomo 配置，并关闭订阅中的规则、DNS、TUN 和外部监听设置。
+展开“其他连接方式”，点击“选择文件”导入 YAML、URI 或 Base64 节点文件，也可以粘贴订阅地址。将已知可信的出口 IP 或 CIDR 网段加入白名单，然后点击“开启严格保护”。GPTGuard 会解析节点并生成自己的 Mihomo 配置。
 
 GPTGuard 只把 Mihomo 和 Codex 网关绑定到 `127.0.0.1`。端口由程序管理，用户无需填写。
 
@@ -46,6 +46,8 @@ GPTGuard.exe --cli codex restore
 `web` 命令、旧的 `gptguard-cli.exe` 和 CMD 启动脚本只用于旧版本兼容，不属于 v0.4.0 的主路径。
 
 ## 排障
+
+点击“查看诊断”可以核对后台的管理员权限。以管理员身份重新启动时，GPTGuard 会接替尚未开启保护的普通权限后台。如果窗口提示后台版本较旧，或仍提示权限不足，先关闭主窗口，再从 Windows 通知区选择“退出 GPTGuard”，然后右键启动新版。
 
 日志在 `%LOCALAPPDATA%\GPTGuard\logs\`。先在主界面点击“查看诊断”，再检查：
 

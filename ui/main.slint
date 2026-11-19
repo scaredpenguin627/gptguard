@@ -1,201 +1,162 @@
-import { Button, CheckBox, HorizontalBox, LineEdit, Palette, ScrollView, VerticalBox } from "std-widgets.slint";
+import { Button, LineEdit, Palette, ScrollView } from "std-widgets.slint";
 
+component Heading inherits Text {
+    font-size: 18px;
+    font-weight: 700;
+    color: #182c3b;
+}
+component BodyText inherits Text {
+    color: #44596a;
+    wrap: word-wrap;
+}
+component Card inherits Rectangle {
+    background: #ffffff;
+    border-width: 1px;
+    border-color: #d8e1e5;
+    border-radius: 10px;
+}
 export component MainWindow inherits Window {
     title: "GPTGuard";
-    // Give the guidance card enough room to stay readable on the first run.
-    // The previous 620px window left only a narrow strip visible after the
-    // status and action cards grew to accommodate diagnostics.
-    width: 920px;
-    height: 720px;
-    background: #f6f7fb;
+    preferred-width: 840px;
+    preferred-height: 610px;
+    min-width: 490px;
+    min-height: 340px;
+    background: #f4f7f8;
 
-    in property <string> status_text: "正在启动";
-    in property <string> detail_text: "正在连接 GPTGuard 后台";
-    in property <string> route_text: "自动检测本机代理，或导入订阅";
-    in property <string> codex_text: "正在检测 Codex 配置";
-    in property <bool> protection_enabled: false;
-    in property <bool> setup_needed: true;
-    in property <bool> operation_busy: false;
-    in property <bool> trust_candidate_visible: false;
-    in property <string> trust_candidate_ip: "";
+    in property <string> status_text: "正在连接后台";
+    in property <string> detail_text;
+    in property <string> action_text;
+    in property <bool> action_failed;
+    in property <bool> state_known;
+    in property <bool> protection_enabled;
+    in property <bool> protection_healthy;
+    in property <bool> protection_problem;
+    in property <bool> operation_busy;
+    in property <string> route_text: "正在读取出口配置";
+    in property <string> codex_text: "正在读取 Codex 配置";
+    in property <bool> setup_needed;
     in property <string> takeover_label: "确认接管配置";
-    in-out property <string> subscription_text: "";
+    in property <string> doctor_text;
+    in property <string> about_text;
+    in property <string> trust_candidate_ip;
+    in property <string> trust_candidate_proxy;
+    in property <bool> activate_after_trust;
+    private property <bool> show_more: false;
+    private property <bool> show_doctor: false;
+    private property <bool> show_about: false;
+    private property <bool> ready: root.state_known && !root.operation_busy;
 
-    // The window surface is deliberately light. Keep standard widgets on the
-    // same palette when Windows itself is using dark mode.
-    init => {
-        Palette.color-scheme = ColorScheme.light;
-    }
-
+    init => { Palette.color-scheme = ColorScheme.light; }
     callback refresh_clicked();
-    callback diagnostics_clicked();
-    callback about_clicked();
     callback connect_local_clicked();
-    callback trust_local_exit_clicked(string);
+    callback trust_local_exit_clicked(string, string, bool);
     callback import_clicked(string);
     callback file_clicked();
+    callback add_exit_clicked(string);
     callback takeover_clicked();
     callback restore_clicked();
     callback protection_clicked(bool);
 
-    VerticalBox {
-        padding: 28px;
-        spacing: 18px;
-
-        HorizontalBox {
+    ScrollView {
+        horizontal-scrollbar-policy: always-off;
+        content-width: self.visible-width;
+        VerticalLayout {
+            padding: 22px;
             spacing: 12px;
-            Text {
-                text: "GPTGuard";
-                font-size: 28px;
-                font-weight: 700;
-                color: #182033;
+            alignment: start;
+            HorizontalLayout {
+                spacing: 8px;
+                VerticalLayout {
+                    Text { text: "GPTGuard"; font-size: 26px; font-weight: 750; color: #182c3b; }
+                    BodyText { text: "出口保护与 Codex 网关"; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Button { text: "检测出口"; height: 34px; enabled: root.ready; clicked => { root.refresh_clicked(); } }
+                Button { text: root.show_doctor ? "收起诊断" : "查看诊断"; height: 34px; clicked => { root.show_doctor = !root.show_doctor; } }
+                Button { text: "关于"; height: 34px; clicked => { root.show_about = !root.show_about; } }
             }
-            Text {
-                text: "出口保护与 Codex 网关";
-                vertical-alignment: center;
-                color: #687089;
-                font-size: 14px;
-            }
-            Rectangle { horizontal-stretch: 1; }
-            Button {
-                text: "立即检测";
-                clicked => { root.refresh_clicked(); }
-            }
-            Button {
-                text: "查看诊断";
-                clicked => { root.diagnostics_clicked(); }
-            }
-
-            Button {
-                text: "关于";
-                clicked => { root.about_clicked(); }
-            }
-        }
-
-        Rectangle {
-            // Runtime diagnostics can contain several lines. Reserve enough
-            // room for them and scroll inside the card instead of letting the
-            // text paint over the cards below.
-            height: 180px;
-            // A failed check must be visually distinct from a healthy
-            // protected state. The old card stayed green whenever the
-            // checkbox was on, even while the status said "已阻断".
-            background: root.status_text == "已阻断" ? #fff0f0 : root.protection_enabled ? #e8f7ee : #fff4dc;
-            border-radius: 14px;
-            border-width: 1px;
-            border-color: root.status_text == "已阻断" ? #efb4b4 : root.protection_enabled ? #b6e3c7 : #f0d18a;
-
-            HorizontalBox {
-                padding: 20px;
-                spacing: 16px;
-                VerticalBox {
-                    horizontal-stretch: 1;
-                    spacing: 5px;
-                    Text {
-                        text: root.status_text;
-                        font-size: 24px;
-                        font-weight: 700;
-                        color: #182033;
+            if root.show_about: BodyText { text: root.about_text; }
+            Card {
+                background: root.protection_problem ? #fff3ef : root.protection_healthy ? #e9f6ee : #eef4f6;
+                border-color: root.protection_problem ? #dfa899 : root.protection_healthy ? #a0ccae : #c4d5db;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 7px;
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Heading { text: root.status_text; vertical-alignment: center; horizontal-stretch: 1; font-size: 22px; }
+                        protection := Button {
+                            text: root.protection_enabled ? "关闭严格保护" : "开启严格保护";
+                            primary: !root.protection_enabled;
+                            height: 36px;
+                            enabled: root.ready;
+                            clicked => { root.protection_clicked(!root.protection_enabled); }
+                        }
                     }
-                    ScrollView {
-                        content-width: self.width;
-                        vertical-scrollbar-policy: as-needed;
-                        horizontal-scrollbar-policy: always-off;
-                        Text {
-                            width: parent.width;
-                            text: root.detail_text;
-                            color: #536078;
-                            wrap: word-wrap;
+                    BodyText { text: root.detail_text; }
+                    if root.action_text != "": BodyText {
+                        text: root.action_text;
+                        font-weight: 600;
+                        color: root.action_failed ? #983522 : #155865;
+                    }
+                    if root.trust_candidate_ip != "": HorizontalLayout {
+                        alignment: start;
+                        Button {
+                            text: (root.activate_after_trust ? "信任并开启保护 · " : "信任出口 · ") + root.trust_candidate_ip;
+                            enabled: root.ready;
+                            primary: true;
+                            clicked => { root.trust_local_exit_clicked(root.trust_candidate_ip, root.trust_candidate_proxy, root.activate_after_trust); }
                         }
                     }
                 }
-                CheckBox {
-                    text: root.protection_enabled ? (root.status_text == "已阻断" ? "保护已开启 · 出口已阻断" : "保护已开启") : "开启严格保护";
-                    checked: root.protection_enabled;
-                    toggled => { root.protection_clicked(self.checked); }
+            }
+            if root.show_doctor: Card {
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 6px;
+                    Heading { text: "后台诊断"; }
+                    BodyText { text: root.doctor_text == "" ? "等候后台返回诊断结果" : root.doctor_text; }
                 }
             }
-        }
-
-        HorizontalBox {
-            spacing: 16px;
-            Rectangle {
-                horizontal-stretch: 1;
-                background: white;
-                border-radius: 12px;
-                border-width: 1px;
-                border-color: #e1e5ee;
-                VerticalBox {
-                    padding: 18px;
-                    spacing: 10px;
-                    Text { text: "出口"; font-size: 18px; font-weight: 700; color: #182033; }
-                    Text { text: root.route_text; color: #536078; wrap: word-wrap; }
-                    Button {
-                        text: root.operation_busy ? "正在连接…" : "一键连接 Clash Verge";
-                        primary: true;
-                        enabled: !root.operation_busy;
-                        clicked => { root.connect_local_clicked(); }
-                    }
-                    LineEdit {
-                        placeholder-text: "粘贴订阅地址（可选）";
-                        text <=> root.subscription_text;
-                        enabled: !root.operation_busy;
-                    }
-                    // Keep the trust action on its own row. Four buttons in a
-                    // single row overflow the export card on a narrow window.
-                    Button {
-                        visible: root.trust_candidate_visible;
-                        text: "信任出口 " + root.trust_candidate_ip;
-                        primary: true;
-                        enabled: !root.operation_busy;
-                        clicked => { root.trust_local_exit_clicked(root.trust_candidate_ip); }
-                    }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button { text: "导入并检测"; enabled: !root.operation_busy; clicked => { root.import_clicked(root.subscription_text); } }
-                        Button { text: "选择文件"; enabled: !root.operation_busy; clicked => { root.file_clicked(); } }
-                        Button { text: "刷新状态"; enabled: !root.operation_busy; clicked => { root.refresh_clicked(); } }
-                    }
-                }
-            }
-            Rectangle {
-                horizontal-stretch: 1;
-                background: white;
-                border-radius: 12px;
-                border-width: 1px;
-                border-color: #e1e5ee;
-                VerticalBox {
-                    padding: 18px;
-                    spacing: 10px;
-                    Text { text: "Codex"; font-size: 18px; font-weight: 700; color: #182033; }
-                    Text { text: root.codex_text; color: #536078; wrap: word-wrap; }
-                    Button { text: root.takeover_label; enabled: root.setup_needed; clicked => { root.takeover_clicked(); } }
-                    Button { text: "恢复原配置（保留冲突副本）"; clicked => { root.restore_clicked(); } }
-                }
-            }
-        }
-
-        Rectangle {
-            vertical-stretch: 1;
-            background: white;
-            border-radius: 12px;
-            border-width: 1px;
-            border-color: #e1e5ee;
-            ScrollView {
-                        content-width: self.width;
-                VerticalBox {
-                    padding: 18px;
+            Card {
+                VerticalLayout {
+                    padding: 16px;
                     spacing: 8px;
-                    Text { text: "使用说明"; font-size: 18px; font-weight: 700; color: #182033; }
-                    Text {
-                        text: "首次使用：先点击“一键连接 Clash Verge”；连接不到本机代理时，再粘贴订阅或选择节点文件。连接后会进行真实出口检测，确认 Codex 配置差异后再开启严格保护。节点退出、出口失配或内核损坏时，GPTGuard 会停止转发，不会自动走直连。";
-                        color: #536078;
-                        wrap: word-wrap;
+                    Heading { text: "代理出口"; }
+                    BodyText { text: root.route_text; }
+                    HorizontalLayout {
+                        alignment: start;
+                        spacing: 8px;
+                        Button { text: "连接 Clash Verge"; enabled: root.ready; clicked => { root.connect_local_clicked(); } }
+                        Button { text: root.show_more ? "收起其他方式" : "其他连接方式"; clicked => { root.show_more = !root.show_more; } }
                     }
-                    Text {
-                        text: "所有内部端口只监听 127.0.0.1，用户不需要填写端口。管理界面是本地 Rust 桌面窗口，不会打开浏览器。";
-                        color: #536078;
-                        wrap: word-wrap;
+                    if root.show_more: VerticalLayout {
+                        spacing: 6px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            subscription := LineEdit { placeholder-text: "订阅地址"; enabled: root.ready; }
+                            Button { text: "导入订阅"; enabled: root.ready && subscription.text != ""; clicked => { root.import_clicked(subscription.text); } }
+                            Button { text: "选择文件"; enabled: root.ready; clicked => { root.file_clicked(); } }
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            entry := LineEdit { placeholder-text: "已知的出口 IP 或 CIDR 网段"; enabled: root.ready; }
+                            Button { text: "加入白名单"; enabled: root.ready && entry.text != ""; clicked => { root.add_exit_clicked(entry.text); } }
+                        }
+                    }
+                }
+            }
+            Card {
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 8px;
+                    Heading { text: "Codex 网关"; }
+                    BodyText { text: root.codex_text; }
+                    HorizontalLayout {
+                        alignment: start;
+                        spacing: 8px;
+                        Button { text: root.takeover_label; enabled: root.ready && root.setup_needed; clicked => { root.takeover_clicked(); } }
+                        Button { text: "恢复原配置"; enabled: root.ready; clicked => { root.restore_clicked(); } }
                     }
                 }
             }

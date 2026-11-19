@@ -133,12 +133,12 @@ impl ProxyRuntime {
             routes::build_routes(&config)?
         };
         let selection = load_selection(&config, &self.inner.paths);
-        *self.inner.routes.write().unwrap() = routes;
-        *self.inner.selection.write().unwrap() = selection;
         let mut current = self.inner.config.write().unwrap();
-        if serde_json::to_value(&current.protection)? != serde_json::to_value(&config.protection)? {
+        if !current.same_egress_policy(&config) {
             self.inner.egress_allowed.store(false, Ordering::Release);
         }
+        *self.inner.routes.write().unwrap() = routes;
+        *self.inner.selection.write().unwrap() = selection;
         *current = config;
         Ok(())
     }
@@ -155,7 +155,29 @@ impl ProxyRuntime {
 
     pub async fn check_egress(&self, config: &Config) -> crate::ipcheck::IpReport {
         if !config.mihomo.enabled {
-            return crate::ipcheck::check(config).await;
+            let mut report = crate::ipcheck::check(config).await;
+            if config.protection.enabled && report.allowed {
+                // A separate probe proxy may be configured for the system guard.
+                // Each additional relay path must also pass before forwarding.
+                let routes = self.inner.routes.read().unwrap().clone();
+                for route in routes {
+                    if route.url != config.protection.http_proxy {
+                        let mut route_config = config.clone();
+                        route_config.protection.http_proxy = route.url;
+                        let result = crate::ipcheck::check(&route_config).await;
+                        if !result.allowed {
+                            report = result;
+                            break;
+                        }
+                    }
+                }
+            }
+            let current = self.inner.config.read().unwrap();
+            report.allowed &= current.same_egress_policy(config);
+            self.inner
+                .egress_allowed
+                .store(report.allowed, Ordering::Release);
+            return report;
         }
         let routes = self.inner.routes.read().unwrap().clone();
         let checked_pid = self.inner.sidecar.status().pid.unwrap_or(0);
@@ -192,8 +214,7 @@ impl ProxyRuntime {
         let current = self.inner.config.read().unwrap();
         let allowed = self.inner.sidecar.available()
             && self.inner.sidecar.status().pid == Some(checked_pid)
-            && serde_json::to_value(&current.protection).ok()
-                == serde_json::to_value(&config.protection).ok()
+            && current.same_egress_policy(config)
             && reports.iter().all(|r| r.allowed);
         self.inner.egress_pid.store(checked_pid, Ordering::Release);
         self.inner.egress_allowed.store(allowed, Ordering::Release);
@@ -239,14 +260,16 @@ impl ProxyRuntime {
             mihomo: self.inner.sidecar.status(),
             detail: if !config.mihomo.enabled {
                 if matches {
-                    "本机代理已连接，转发服务运行中".into()
+                    "转发服务运行中".into()
                 } else {
-                    "本机代理已连接，Codex 尚未接管".into()
+                    "Codex 尚未接管".into()
                 }
             } else if !self.inner.sidecar.available() {
                 "Mihomo 未就绪；请求将返回 503".into()
             } else if matches {
                 "转发服务运行中".into()
+            } else if !selection.owned {
+                "Codex 尚未接管".into()
             } else {
                 "Codex 配置在接管后被修改；请求将返回 409".into()
             },
@@ -392,26 +415,23 @@ impl ProxyRuntime {
                 "Mihomo 未就绪；已停止转发，不回退直连",
             ));
         }
-        let guarded = {
-            let config = self.inner.config.read().unwrap();
-            config.mihomo.enabled && config.protection.enabled
-        };
-        if guarded
+        let config = self.inner.config.read().unwrap();
+        if config.protection.enabled
             && (!self.inner.egress_allowed.load(Ordering::Acquire)
-                || self.inner.sidecar.status().pid
-                    != Some(self.inner.egress_pid.load(Ordering::Acquire)))
+                || (config.mihomo.enabled
+                    && self.inner.sidecar.status().pid
+                        != Some(self.inner.egress_pid.load(Ordering::Acquire))))
         {
             return Err(local_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "egress_unverified",
-                "Mihomo 出口尚未全部通过白名单检测",
+                "出口尚未通过白名单检测",
             ));
         }
         let selection = self.inner.selection.read().unwrap().clone();
         if !selection.owned {
             return Ok(());
         }
-        let config = self.inner.config.read().unwrap().clone();
         let status = config_tx::current_status(&config, &self.inner.paths);
         if !status.config_matches {
             return Err(local_error(

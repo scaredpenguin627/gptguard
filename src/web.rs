@@ -55,6 +55,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/codex/trust-local-exit", post(api_trust_local_exit))
         .route("/api/codex/auto-proxy", post(api_auto_proxy))
         .route("/api/shutdown", post(api_shutdown))
+        .route("/api/restart-idle", post(api_restart_idle))
         .route("/api/update-lock", post(api_update_lock))
         .route("/api/autostart", post(api_autostart))
         .with_state(state)
@@ -134,6 +135,8 @@ async fn api_status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
+            "daemon_elevated": util::is_elevated(),
+            "local_proxy": local_exit_proxy(&cfg),
             "runtime": state.runtime(),
             "proxy": state.proxy_status(),
             "config": config_view(&cfg),
@@ -199,10 +202,22 @@ async fn api_check(State(state): State<AppState>, headers: HeaderMap) -> Respons
     if let Err(response) = authorized(&state, &headers) {
         return response;
     }
+    let before = state.config();
     let runtime = state.check_now().await;
+    let current = state.config();
+    let candidate = if before.same_egress_policy(&current)
+        && runtime.detected
+        && current.protection.whitelist.is_empty()
+    {
+        local_exit_proxy(&current)
+            .zip(runtime.http_ip.as_deref().and_then(valid_exit_ip))
+            .map(|(proxy, ip)| serde_json::json!({"proxy": proxy, "ip": ip}))
+    } else {
+        None
+    };
     (
         StatusCode::OK,
-        Json(serde_json::json!({"ok": true, "runtime": runtime})),
+        Json(serde_json::json!({"ok": true, "runtime": runtime, "trust_candidate": candidate})),
     )
         .into_response()
 }
@@ -210,6 +225,25 @@ async fn api_check(State(state): State<AppState>, headers: HeaderMap) -> Respons
 #[derive(Deserialize)]
 struct ProtectionBody {
     enabled: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ActivationError {
+    #[error("请先连接 Clash Verge 并确认出口 IP，或在“其他连接方式”中填写已知的出口白名单。")]
+    Whitelist,
+    #[error("GPTGuard 后台以普通权限运行。请关闭主窗口，从通知区退出 GPTGuard，再右键选择“以管理员身份运行”。")]
+    Elevation,
+}
+
+fn set_protection(cfg: &mut Config, enabled: bool, can_enforce: bool) -> Result<()> {
+    if enabled && cfg.protection.whitelist.is_empty() {
+        return Err(ActivationError::Whitelist.into());
+    }
+    if enabled && (cfg.protection.network_guard || cfg.protection.proxy_only) && !can_enforce {
+        return Err(ActivationError::Elevation.into());
+    }
+    cfg.protection.enabled = enabled;
+    Ok(())
 }
 
 async fn api_protection(
@@ -220,31 +254,30 @@ async fn api_protection(
     if let Err(response) = authorized(&state, &headers) {
         return response;
     }
-    if body.enabled && state.config().protection.whitelist.is_empty() {
-        return api_error(
-            StatusCode::CONFLICT,
-            "whitelist_required",
-            "请先连接并确认一个出口 IP，再开启严格保护",
-        );
+    if let Err(err) = state.update_config(|cfg| {
+        set_protection(cfg, body.enabled, !cfg!(windows) || util::is_elevated())
+    }) {
+        let (status, code) = match err.downcast_ref::<ActivationError>() {
+            Some(ActivationError::Whitelist) => (StatusCode::CONFLICT, "whitelist_required"),
+            Some(ActivationError::Elevation) => {
+                (StatusCode::FORBIDDEN, "daemon_elevation_required")
+            }
+            None => (StatusCode::INTERNAL_SERVER_ERROR, "save_failed"),
+        };
+        return api_error(status, code, &format!("{err:#}"));
     }
-    let mut cfg = state.config();
-    cfg.protection.enabled = body.enabled;
-    if let Err(err) = state.save_config(&cfg) {
-        return api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "save_failed",
-            &format!("{err:#}"),
-        );
-    }
-    if !body.enabled {
-        let _ = crate::guard::enforce(&cfg, false);
-    }
-    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "enabled": body.enabled})),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
 struct WhitelistBody {
     entries: Vec<String>,
+    #[serde(default)]
+    append: bool,
 }
 
 async fn api_whitelist(
@@ -270,9 +303,18 @@ async fn api_whitelist(
         }
         entries.push(entry);
     }
-    let mut cfg = state.config();
-    cfg.protection.whitelist = entries;
-    if let Err(err) = state.save_config(&cfg) {
+    if let Err(err) = state.update_config(|cfg| {
+        if body.append {
+            for entry in entries {
+                if !cfg.protection.whitelist.contains(&entry) {
+                    cfg.protection.whitelist.push(entry);
+                }
+            }
+        } else {
+            cfg.protection.whitelist = entries;
+        }
+        Ok(())
+    }) {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "save_failed",
@@ -710,9 +752,14 @@ async fn api_connect_local(State(state): State<AppState>, headers: HeaderMap) ->
         );
     }
     let changed = cfg.codex.direct
-        || cfg.mihomo.enabled == false
+        || cfg.mihomo.enabled
         || cfg.protection.http_proxy.as_deref() != Some(proxy.as_str())
-        || cfg.codex.routes.first().map(|route| route.url.as_str()) != Some(proxy.as_str());
+        || !cfg
+            .codex
+            .routes
+            .iter()
+            .any(|route| route.id == "auto-local" && route.enabled && route.url == proxy)
+        || cfg.protection.ip_check_mode != crate::config::IpCheckMode::Http;
     if auto_routes == 0 {
         cfg.codex.routes.push(RouteConfig {
             id: "auto-local".into(),
@@ -754,6 +801,40 @@ async fn api_connect_local(State(state): State<AppState>, headers: HeaderMap) ->
 #[derive(Deserialize)]
 struct TrustLocalExitBody {
     ip: String,
+    proxy: Option<String>,
+}
+
+fn valid_exit_ip(text: &str) -> Option<std::net::IpAddr> {
+    let ip: std::net::IpAddr = text.trim().parse().ok()?;
+    (!ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()).then_some(ip)
+}
+
+fn local_exit_proxy(cfg: &Config) -> Option<String> {
+    if cfg.codex.direct
+        || cfg.mihomo.enabled
+        || cfg.protection.ip_check_mode != crate::config::IpCheckMode::Http
+    {
+        return None;
+    }
+    let mut enabled = cfg.codex.routes.iter().filter(|route| route.enabled);
+    let route = enabled.next()?;
+    let url = url::Url::parse(&route.url).ok()?;
+    let local = match url.host()? {
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+        url::Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
+    };
+    (enabled.next().is_none()
+        && route.id == "auto-local"
+        && route.mihomo.is_none()
+        && local
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && matches!(url.path(), "" | "/")
+        && url == url::Url::parse(cfg.protection.http_proxy.as_deref()?).ok()?)
+    .then(|| url.to_string())
 }
 
 async fn api_trust_local_exit(
@@ -764,21 +845,14 @@ async fn api_trust_local_exit(
     if let Err(response) = authorized(&state, &headers) {
         return response;
     }
-    let Ok(ip) = body.ip.trim().parse::<std::net::IpAddr>() else {
+    let Some(ip) = valid_exit_ip(&body.ip) else {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_exit_ip",
-            "出口 IP 格式不正确",
+            "请输入有效的出口 IP 地址",
         );
     };
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_exit_ip",
-            "不能信任回环或特殊地址",
-        );
-    }
-    let mut cfg = state.config();
+    let cfg = state.config();
     if !cfg.protection.whitelist.is_empty() {
         return api_error(
             StatusCode::CONFLICT,
@@ -786,20 +860,24 @@ async fn api_trust_local_exit(
             "出口白名单已经配置",
         );
     }
-    let enabled: Vec<_> = cfg
-        .codex
-        .routes
-        .iter()
-        .filter(|route| route.enabled)
-        .collect();
-    if enabled.len() != 1 || enabled[0].id != "auto-local" {
+    let Some(proxy) = local_exit_proxy(&cfg) else {
         return api_error(
             StatusCode::CONFLICT,
             "local_route_required",
             "只有唯一的 Clash Verge 本机出口可以执行此操作",
         );
+    };
+    if body
+        .proxy
+        .as_ref()
+        .is_some_and(|expected| expected != &proxy)
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "route_changed",
+            "本机代理已变化，请重新检测出口。",
+        );
     }
-    let proxy = enabled[0].url.clone();
     let report = state.proxy.check_egress(&cfg).await;
     if !report.detected || report.http_ip != Some(ip) {
         return api_error(
@@ -808,9 +886,15 @@ async fn api_trust_local_exit(
             "重新检测到的出口 IP 已变化，请重新连接并确认",
         );
     }
-    cfg.protection.whitelist = vec![ip.to_string()];
-    if let Err(err) = state.save_config(&cfg) {
-        return api_error(StatusCode::BAD_REQUEST, "save_failed", &format!("{err:#}"));
+    if let Err(err) = state.update_config(|current| {
+        anyhow::ensure!(
+            current.same_egress_policy(&cfg),
+            "检测期间出口配置已变化，请重新检测并确认。"
+        );
+        current.protection.whitelist.push(ip.to_string());
+        Ok(())
+    }) {
+        return api_error(StatusCode::CONFLICT, "trust_failed", &format!("{err:#}"));
     }
     (
         StatusCode::OK,
@@ -825,6 +909,20 @@ async fn api_shutdown(State(state): State<AppState>, headers: HeaderMap) -> Resp
     }
     state.request_shutdown();
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+}
+
+async fn api_restart_idle(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorized(&state, &headers) {
+        return response;
+    }
+    if !state.request_idle_restart() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "restart_rejected",
+            "后台已提权或正在防护，请刷新状态。",
+        );
+    }
+    Json(serde_json::json!({"ok": true, "restart_required": true})).into_response()
 }
 
 #[derive(Deserialize)]
@@ -903,7 +1001,64 @@ pub fn routes_map() -> HashMap<&'static str, &'static str> {
         ("POST", "/api/codex/trust-local-exit"),
         ("POST", "/api/codex/auto-proxy"),
         ("POST", "/api/shutdown"),
+        ("POST", "/api/restart-idle"),
         ("POST", "/api/update-lock"),
         ("POST", "/api/autostart"),
     ])
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+
+    #[test]
+    fn strict_activation_requires_the_worker_to_be_able_to_enforce() {
+        let mut cfg = Config::default();
+        assert!(matches!(
+            set_protection(&mut cfg, true, true)
+                .unwrap_err()
+                .downcast_ref(),
+            Some(ActivationError::Whitelist)
+        ));
+        cfg.protection.whitelist.push("203.0.113.7".into());
+        assert!(matches!(
+            set_protection(&mut cfg, true, false)
+                .unwrap_err()
+                .downcast_ref(),
+            Some(ActivationError::Elevation)
+        ));
+        assert!(!cfg.protection.enabled);
+        set_protection(&mut cfg, true, true).unwrap();
+        assert!(cfg.protection.enabled);
+        set_protection(&mut cfg, false, false).unwrap();
+        assert!(!cfg.protection.enabled);
+    }
+
+    #[test]
+    fn trust_candidates_require_the_measured_route_to_be_the_only_local_exit() {
+        let mut cfg = Config::default();
+        cfg.mihomo.enabled = false;
+        cfg.codex.direct = false;
+        cfg.protection.ip_check_mode = crate::config::IpCheckMode::Http;
+        cfg.protection.http_proxy = Some("http://127.0.0.1:7897/".into());
+        cfg.codex.routes = vec![RouteConfig {
+            id: "auto-local".into(),
+            label: "Clash".into(),
+            url: "http://127.0.0.1:7897".into(),
+            mihomo: None,
+            enabled: true,
+        }];
+        assert_eq!(
+            local_exit_proxy(&cfg).as_deref(),
+            Some("http://127.0.0.1:7897/")
+        );
+        cfg.codex.direct = true;
+        assert!(local_exit_proxy(&cfg).is_none());
+        cfg.codex.direct = false;
+        cfg.codex.routes[0].url = "http://127.0.0.1:7898".into();
+        assert!(local_exit_proxy(&cfg).is_none());
+        cfg.protection.http_proxy = Some(cfg.codex.routes[0].url.clone());
+        cfg.codex.routes.push(cfg.codex.routes[0].clone());
+        assert!(local_exit_proxy(&cfg).is_none());
+    }
 }

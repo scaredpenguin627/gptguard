@@ -1,22 +1,115 @@
-//! Native first-run and status window.
-//!
-//! The management HTTP API remains available as a compatibility transport for
-//! the daemon and the hidden CLI, but the normal user path is this Rust/Slint
-//! window.  The UI never opens a browser and never exposes the internal ports.
+//! Native status and first-run window. The daemon owns the protection state.
 
-use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use fs2::FileExt;
-use serde_json::Value;
+use serde_json::{json, Value};
+use slint::ComponentHandle;
 
 use crate::config::{AppPaths, Config};
-use crate::service;
-use crate::util;
+use crate::{service, util};
 
 slint::include_modules!();
+
+#[cfg(test)]
+mod tests;
+
+#[derive(Default)]
+struct ActionResult {
+    message: String,
+    candidate: Option<(String, String)>,
+    activate_after_trust: bool,
+}
+
+impl ActionResult {
+    fn message(text: impl Into<String>) -> Self {
+        Self {
+            message: text.into(),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Ui {
+    paths: Arc<AppPaths>,
+    window: slint::Weak<MainWindow>,
+    revision: Arc<AtomicU64>,
+    polling: Arc<AtomicBool>,
+}
+
+impl Ui {
+    // Called on the UI thread. Disable conflicting actions synchronously,
+    // before a second click can schedule another configuration change.
+    fn action(
+        &self,
+        progress: &str,
+        run: impl FnOnce(&AppPaths) -> Result<ActionResult> + Send + 'static,
+    ) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        if window.get_operation_busy() {
+            return;
+        }
+        self.revision.fetch_add(1, Ordering::Relaxed);
+        window.set_operation_busy(true);
+        window.set_action_failed(false);
+        window.set_action_text(progress.into());
+        window.set_trust_candidate_ip("".into());
+        let ui = self.clone();
+        std::thread::spawn(move || {
+            let result = run(&ui.paths);
+            let snapshot = fetch_status(&ui.paths);
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(window) = ui.window.upgrade() else {
+                    return;
+                };
+                match &result {
+                    Ok(outcome) => {
+                        window.set_action_text(outcome.message.as_str().into());
+                        if let Some((proxy, ip)) = &outcome.candidate {
+                            window.set_trust_candidate_proxy(proxy.as_str().into());
+                            window.set_trust_candidate_ip(ip.as_str().into());
+                            window.set_activate_after_trust(outcome.activate_after_trust);
+                        }
+                    }
+                    Err(err) => {
+                        window.set_action_failed(true);
+                        window.set_action_text(format!("{err:#}").into());
+                    }
+                }
+                // A status refresh owns the state label, never the action result.
+                show_status(&window, snapshot);
+                window.set_operation_busy(false);
+            });
+        });
+    }
+
+    fn poll(&self) {
+        if self.window.upgrade().is_none_or(|w| w.get_operation_busy())
+            || self.polling.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let revision = self.revision.load(Ordering::Relaxed);
+        let ui = self.clone();
+        std::thread::spawn(move || {
+            let snapshot = fetch_status(&ui.paths);
+            let _ = slint::invoke_from_event_loop(move || {
+                ui.polling.store(false, Ordering::Relaxed);
+                if ui.revision.load(Ordering::Relaxed) == revision {
+                    if let Some(window) = ui.window.upgrade() {
+                        show_status(&window, snapshot);
+                    }
+                }
+            });
+        });
+    }
+}
 
 pub fn run() -> Result<()> {
     let paths = AppPaths::discover();
@@ -24,586 +117,433 @@ pub fn run() -> Result<()> {
     util::init_logging(&paths.log_dir)?;
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(paths.data_dir.join("ui.lock"))
         .context("open UI lock")?;
     if lock_file.try_lock_exclusive().is_err() {
+        // An explicitly elevated second launch can supply the worker to the
+        // existing window. An active guard is never restarted for elevation.
+        if cfg!(windows) && util::is_elevated() {
+            upgrade_idle_daemon(&paths, &fetch_status(&paths)?)?;
+        }
         return Ok(());
     }
-    ensure_daemon(&paths)?;
-
     let window = MainWindow::new().context("create native window")?;
-    let shared = Arc::new(paths);
-    let operation_lock = Arc::new(std::sync::Mutex::new(()));
+    window.set_about_text(
+        concat!(
+            "GPTGuard v",
+            env!("CARGO_PKG_VERSION"),
+            "  ·  内置 Mihomo v1.19.34（GPL-3.0）"
+        )
+        .into(),
+    );
+    let ui = Ui {
+        paths: Arc::new(paths),
+        window: window.as_weak(),
+        revision: Default::default(),
+        polling: Default::default(),
+    };
+    bind_actions(&window, &ui);
+    ui.action("正在连接 GPTGuard 后台…", |paths| {
+        ensure_daemon(paths)?;
+        Ok(ActionResult::default())
+    });
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_secs(3),
+        move || ui.poll(),
+    );
+    window.run().context("run native window")
+}
 
-    {
-        let paths = shared.clone();
-        let weak = window.as_weak();
-        window.on_refresh_clicked(move || {
-            refresh_async(paths.clone(), weak.clone());
-        });
-    }
-    {
-        let paths = shared.clone();
-        let weak = window.as_weak();
-        window.on_diagnostics_clicked(move || {
-            diagnostics_async(paths.clone(), weak.clone());
-        });
-    }
-    {
-        let weak = window.as_weak();
-        window.on_about_clicked(move || {
-            set_detail(
-                weak.clone(),
-                "GPTGuard v0.4.4 · 内置 Mihomo v1.19.34（GPL-3.0）\n源码：https://github.com/MetaCubeX/mihomo\nGPTGuard 只把 Mihomo 作为受监督的出站 sidecar，不开放局域网监听。".into(),
-            );
-        });
-    }
-    {
-        let paths = shared.clone();
-        let weak = window.as_weak();
-        let lock = operation_lock.clone();
-        window.on_connect_local_clicked(move || {
-            set_operation_busy(weak.clone(), true);
-            connect_local_async(paths.clone(), weak.clone(), lock.clone());
-        });
-    }
-    {
-        let paths = shared.clone();
-        let weak = window.as_weak();
-        let lock = operation_lock.clone();
-        window.on_trust_local_exit_clicked(move |ip| {
-            set_operation_busy(weak.clone(), true);
-            trust_local_exit_async(paths.clone(), weak.clone(), lock.clone(), ip.to_string());
-        });
-    }
-    {
-        let paths = shared.clone();
-        let weak = window.as_weak();
-        window.on_import_clicked(move |url| {
-            let url = url.trim().to_string();
-            if url.is_empty() {
-                refresh_async(paths.clone(), weak.clone());
-                return;
-            }
-            let weak = weak.clone();
-            let paths = paths.clone();
-            std::thread::spawn(move || {
-                let result = post_api(
-                    &paths,
-                    "/api/codex/subscription",
-                    serde_json::json!({"url": url}),
-                )
-                .and_then(|value| {
-                    restart_if_requested(&paths, &value)?;
-                    Ok(())
-                });
-                let message = match result {
-                    Ok(()) => "订阅已导入，正在检测节点".to_string(),
-                    Err(err) => format!("订阅导入失败：{err:#}"),
-                };
-                update_window(weak, message, paths);
-            });
-        });
-    }
-    {
-        let paths = shared.clone();
-        let weak = window.as_weak();
-        window.on_file_clicked(move || {
-            let paths = paths.clone();
-            let weak = weak.clone();
-            std::thread::spawn(move || {
-                let Some(file) = rfd::FileDialog::new()
-                    .add_filter("节点文件", &["yaml", "yml", "txt"])
-                    .pick_file()
-                else {
-                    return;
-                };
-                let message = match std::fs::read_to_string(&file)
-                    .context("读取节点文件")
-                    .and_then(|content| {
-                        post_api(
-                            &paths,
-                            "/api/codex/import-file",
-                            serde_json::json!({
-                                "name": file.file_name().and_then(|name| name.to_str()).unwrap_or("节点文件"),
-                                "content": content,
-                            }),
-                        )
-                        .and_then(|value| {
-                            restart_if_requested(&paths, &value)?;
-                            Ok(())
-                        })
-                    }) {
-                    Ok(()) => "节点文件已导入，正在检测".to_string(),
-                    Err(err) => format!("节点文件导入失败：{err:#}"),
-                };
-                update_window(weak, message, paths);
-            });
-        });
-    }
-    {
-        let paths = shared.clone();
-        let weak = window.as_weak();
-        window.on_takeover_clicked(move || {
-            let weak = weak.clone();
-            let paths = paths.clone();
-            std::thread::spawn(move || {
-                let result = post_api(
-                    &paths,
-                    "/api/codex/takeover",
-                    serde_json::json!({"auth": "unknown"}),
-                );
-                let message = match result {
-                    Ok(_) => "Codex 配置已接管，provider 身份保持不变".to_string(),
-                    Err(err) => format!("Codex 接管失败：{err:#}"),
-                };
-                set_detail(weak, message);
-            });
-        });
-    }
-    {
-        let paths = shared.clone();
-        let weak = window.as_weak();
-        window.on_restore_clicked(move || {
-            let weak = weak.clone();
-            let paths = paths.clone();
-            std::thread::spawn(move || {
-                let result = post_api(
-                    &paths,
-                    "/api/codex/restore",
-                    serde_json::json!({"force": true}),
-                );
-                match result {
-                    Ok(_) => update_window(
-                        weak,
-                        "Codex 原配置已恢复，当前文件已另存为冲突备份".to_string(),
-                        paths,
-                    ),
-                    Err(err) => set_detail(weak, format!("恢复失败：{err:#}")),
+fn bind_actions(window: &MainWindow, ui: &Ui) {
+    let action = ui.clone();
+    window.on_refresh_clicked(move || {
+        action.action("正在检测实际出口…", |paths| {
+            check_exit(paths, false)
+        })
+    });
+    let action = ui.clone();
+    window.on_connect_local_clicked(move || {
+        action.action("正在查找 Clash Verge 并检测出口…", |paths| {
+            connect_and_check(paths, false)
+        })
+    });
+    let action = ui.clone();
+    window.on_protection_clicked(move |enabled| {
+        action.action(
+            if enabled {
+                "正在检查开启条件与出口…"
+            } else {
+                "正在关闭严格保护…"
+            },
+            move |paths| match change_protection(paths, enabled) {
+                Err(err) if enabled && api_code(&err) == Some("whitelist_required") => {
+                    connect_and_check(paths, true)
                 }
-            });
+                result => result,
+            },
+        );
+    });
+    let action = ui.clone();
+    window.on_trust_local_exit_clicked(move |ip, proxy, enable| {
+        let (ip, proxy) = (ip.to_string(), proxy.to_string());
+        action.action("正在重新核对出口 IP…", move |paths| {
+            post_api(
+                paths,
+                "/api/codex/trust-local-exit",
+                json!({"ip": ip, "proxy": proxy}),
+            )?;
+            if enable {
+                change_protection(paths, true)
+                    .with_context(|| format!("{ip} 已加入白名单，开启严格保护失败"))
+            } else {
+                Ok(ActionResult::message(format!("已信任出口 {ip}。")))
+            }
         });
-    }
-    {
-        let paths = shared.clone();
-        let weak = window.as_weak();
-        window.on_protection_clicked(move |enabled| {
-            let paths = paths.clone();
-            let weak = weak.clone();
-            std::thread::spawn(move || {
-                let result = post_api(
-                    &paths,
-                    "/api/protection",
-                    serde_json::json!({"enabled": enabled}),
-                );
-                let message = match result {
-                    Ok(_) => if enabled {
-                        "严格保护已开启"
-                    } else {
-                        "保护已关闭"
-                    }
-                    .to_string(),
-                    Err(err) => format!("修改保护状态失败：{err:#}"),
-                };
-                update_window(weak, message, paths);
-            });
+    });
+    let action = ui.clone();
+    window.on_add_exit_clicked(move |entry| {
+        let entry = entry.trim().to_string();
+        action.action("正在保存出口白名单…", move |paths| {
+            post_api(
+                paths,
+                "/api/whitelist",
+                json!({"entries":[entry], "append":true}),
+            )?;
+            Ok(ActionResult::message(format!(
+                "已将 {entry} 加入出口白名单。"
+            )))
         });
-    }
+    });
+    let action = ui.clone();
+    window.on_import_clicked(move |subscription| {
+        let url = subscription.trim().to_string();
+        action.action("正在导入订阅并检测出口…", move |paths| {
+            let response = post_api(paths, "/api/codex/subscription", json!({"url": url}))?;
+            restart_if_requested(paths, &response)?;
+            check_exit(paths, false)
+        });
+    });
+    let action = ui.clone();
+    window.on_file_clicked(move || {
+        let Some(file) = rfd::FileDialog::new()
+            .add_filter("节点文件", &["yaml", "yml", "txt"])
+            .pick_file()
+        else {
+            return;
+        };
+        action.action("正在导入文件并检测出口…", move |paths| {
+            let content = std::fs::read_to_string(&file).context("读取节点文件")?;
+            let response = post_api(
+                paths,
+                "/api/codex/import-file",
+                json!({
+                    "name": file.file_name().and_then(|name| name.to_str()).unwrap_or("节点文件"),
+                    "content": content,
+                }),
+            )?;
+            restart_if_requested(paths, &response)?;
+            check_exit(paths, false)
+        });
+    });
+    let action = ui.clone();
+    window.on_takeover_clicked(move || {
+        action.action("正在接管 Codex 配置…", |paths| {
+            post_api(paths, "/api/codex/takeover", json!({"auth": "unknown"}))?;
+            Ok(ActionResult::message("Codex 配置已接管。"))
+        })
+    });
+    let action = ui.clone();
+    window.on_restore_clicked(move || {
+        action.action("正在恢复 Codex 配置…", |paths| {
+            post_api(paths, "/api/codex/restore", json!({"force": true}))?;
+            Ok(ActionResult::message(
+                "Codex 原配置已恢复。如有冲突，已保留副本。",
+            ))
+        })
+    });
+}
 
-    {
-        let paths = shared.clone();
-        let weak = window.as_weak();
-        let lock = operation_lock.clone();
-        set_operation_busy(weak.clone(), true);
-        std::thread::spawn(move || {
-            let _guard = lock.lock().ok();
-            // This is intentionally idempotent: an existing explicit route or
-            // imported subscription always wins over auto-detection.
-            if let Ok(value) = post_api(&paths, "/api/codex/auto-proxy", serde_json::json!({})) {
-                let _ = restart_if_requested(&paths, &value);
-            }
-            match fetch_status(&paths) {
-                Ok(value) => {
-                    apply_snapshot(&weak, &value, false, None);
-                }
-                Err(err) => set_detail(weak.clone(), format!("后台尚未就绪：{err:#}")),
-            }
-            set_operation_busy(weak, false);
+fn change_protection(paths: &AppPaths, enabled: bool) -> Result<ActionResult> {
+    let response = post_api(paths, "/api/protection", json!({"enabled": enabled}))?;
+    if response["enabled"].as_bool() != Some(enabled) {
+        bail!("后台未确认保护状态。请从通知区退出 GPTGuard 后重新启动。");
+    }
+    Ok(ActionResult::message(if enabled {
+        "已开启严格保护。"
+    } else {
+        "已关闭严格保护。"
+    }))
+}
+
+fn connect_and_check(paths: &AppPaths, activate: bool) -> Result<ActionResult> {
+    let response = post_api(paths, "/api/codex/connect-local", json!({})).map_err(|err| {
+        if activate {
+            err.context("开启保护前需要确认出口。请启动 Clash Verge 后重试，或在“其他连接方式”中填写已知的出口 IP")
+        } else { err }
+    })?;
+    restart_if_requested(paths, &response)?;
+    check_exit(paths, activate)
+}
+
+fn check_exit(paths: &AppPaths, activate: bool) -> Result<ActionResult> {
+    let check = post_api(paths, "/api/check", json!({}))?;
+    let candidate = &check["trust_candidate"];
+    if let (Some(proxy), Some(ip)) = (candidate["proxy"].as_str(), candidate["ip"].as_str()) {
+        return Ok(ActionResult {
+            message: format!("检测到出口 {ip}。请核对它是否属于你信任的节点。"),
+            candidate: Some((proxy.into(), ip.into())),
+            activate_after_trust: activate,
         });
     }
-    window.run().context("run native window")?;
-    Ok(())
+    let detail = check["runtime"]["detail"]
+        .as_str()
+        .unwrap_or("后台没有返回检测结果");
+    if !check["runtime"]["detected"].as_bool().unwrap_or(false) {
+        bail!("出口检测失败。请检查代理连接并重试。{detail}");
+    }
+    if activate {
+        bail!("尚未确认可信出口。请重新检测，或在“其他连接方式”中填写已知的出口 IP。");
+    }
+    Ok(ActionResult::message(detail))
 }
 
 fn ensure_daemon(paths: &AppPaths) -> Result<()> {
-    // The tray process owns the notification-area lifetime.  It starts the
-    // same executable's Tokio daemon when needed; starting it here keeps the
-    // one-file installer path free of a second tray binary.
     util::spawn_detached(&util::exe_path(), &["--cli", "tray", "--start-guard"])?;
-    for _ in 0..40 {
-        std::thread::sleep(Duration::from_millis(150));
-        if service::daemon_running(paths) {
-            return Ok(());
-        }
-    }
-    anyhow::bail!("GPTGuard 后台启动超时，请打开诊断查看日志")
+    let status = wait_for_api(paths)?;
+    upgrade_idle_daemon(paths, &status)
 }
 
-fn restart_if_requested(paths: &AppPaths, response: &Value) -> Result<()> {
-    if response["restart_required"].as_bool().unwrap_or(false) {
-        restart_daemon(paths)?;
+fn upgrade_idle_daemon(paths: &AppPaths, status: &Value) -> Result<()> {
+    if cfg!(windows)
+        && util::is_elevated()
+        && status["daemon_elevated"] == false
+        && status["config"]["protection"]["enabled"] == false
+    {
+        let response = post_api(paths, "/api/restart-idle", json!({}))?;
+        restart_if_requested(paths, &response)?;
+        anyhow::ensure!(
+            fetch_status(paths)?["daemon_elevated"] == true,
+            "后台仍以普通权限运行。请从通知区退出 GPTGuard 后，以管理员身份重新启动。"
+        );
     }
     Ok(())
 }
 
-fn restart_daemon(paths: &AppPaths) -> Result<()> {
-    for _ in 0..60 {
+fn wait_for_api(paths: &AppPaths) -> Result<Value> {
+    for _ in 0..50 {
+        if service::daemon_running(paths) {
+            if let Ok(snapshot) = fetch_status(paths) {
+                return Ok(snapshot);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    bail!("连接后台超时。请从通知区退出 GPTGuard 后重新启动。");
+}
+
+fn restart_if_requested(paths: &AppPaths, response: &Value) -> Result<()> {
+    if response["restart_required"] != true {
+        return Ok(());
+    }
+    for _ in 0..80 {
         if !service::daemon_running(paths) {
             util::spawn_detached(&util::exe_path(), &["--cli", "run"])?;
-            for _ in 0..40 {
-                std::thread::sleep(Duration::from_millis(150));
-                if service::daemon_running(paths) {
-                    return Ok(());
-                }
-            }
-            anyhow::bail!("GPTGuard 后台启动超时，请打开诊断查看日志")
+            wait_for_api(paths)?;
+            return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(150));
     }
-    anyhow::bail!("等待后台重启超时，请打开诊断查看日志")
+    bail!("等待后台重启超时。请从通知区退出 GPTGuard 后重新启动。");
 }
 
-fn refresh_async(paths: Arc<AppPaths>, weak: slint::Weak<MainWindow>) {
-    refresh_async_mode(paths, weak, false, None);
-}
-
-fn refresh_async_mode(
-    paths: Arc<AppPaths>,
-    weak: slint::Weak<MainWindow>,
-    allow_trust_candidate: bool,
-    expected_proxy: Option<String>,
-) {
-    std::thread::spawn(move || {
-        let message = match fetch_status(&paths) {
-            Ok(value) => apply_snapshot(
-                &weak,
-                &value,
-                allow_trust_candidate,
-                expected_proxy.as_deref(),
-            ),
-            Err(err) => {
-                set_detail(weak, format!("后台尚未就绪：{err:#}"));
-                return;
-            }
-        };
-        if !message.is_empty() {
-            set_detail(weak, message);
-        }
-    });
-}
-
-fn connect_local_async(
-    paths: Arc<AppPaths>,
-    weak: slint::Weak<MainWindow>,
-    lock: Arc<std::sync::Mutex<()>>,
-) {
-    std::thread::spawn(move || {
-        let _guard = lock.lock().ok();
-        let result = post_api(&paths, "/api/codex/connect-local", serde_json::json!({})).and_then(
-            |response| {
-                let proxy = response["proxy"].as_str().unwrap_or_default().to_string();
-                if proxy.is_empty() {
-                    anyhow::bail!("后台没有返回本机代理地址")
-                }
-                restart_if_requested(&paths, &response)?;
-                let check = post_api(&paths, "/api/check", serde_json::json!({}))?;
-                let status = fetch_status(&paths)?;
-                Ok((proxy, check, status))
-            },
-        );
-        match result {
-            Ok((proxy, check, status)) => {
-                apply_snapshot(&weak, &status, true, Some(&proxy));
-                let detail = check["runtime"]["detail"]
-                    .as_str()
-                    .unwrap_or("本机代理检测完成");
-                set_detail(weak.clone(), format!("已连接 {proxy}；实际检测：{detail}"));
-            }
-            Err(err) => set_detail(weak.clone(), format!("一键连接失败：{err:#}")),
-        }
-        set_operation_busy(weak, false);
-    });
-}
-
-fn trust_local_exit_async(
-    paths: Arc<AppPaths>,
-    weak: slint::Weak<MainWindow>,
-    lock: Arc<std::sync::Mutex<()>>,
-    ip: String,
-) {
-    std::thread::spawn(move || {
-        let _guard = lock.lock().ok();
-        let result = post_api(
-            &paths,
-            "/api/codex/trust-local-exit",
-            serde_json::json!({"ip": ip}),
-        )
-        .and_then(|response| {
-            restart_if_requested(&paths, &response)?;
-            let check = post_api(&paths, "/api/check", serde_json::json!({}))?;
-            let status = fetch_status(&paths)?;
-            Ok((check, status))
-        });
-        match result {
-            Ok((check, status)) => {
-                apply_snapshot(&weak, &status, false, None);
-                let detail = check["runtime"]["detail"]
-                    .as_str()
-                    .unwrap_or("出口信任已更新");
-                set_detail(weak.clone(), format!("已信任出口；实际检测：{detail}"));
-            }
-            Err(err) => set_detail(weak.clone(), format!("信任出口失败：{err:#}")),
-        }
-        set_operation_busy(weak, false);
-    });
-}
-
-fn diagnostics_async(paths: Arc<AppPaths>, weak: slint::Weak<MainWindow>) {
-    std::thread::spawn(move || match fetch_status(&paths) {
-        Ok(value) => {
-            let detail = value["doctor"]
-                .as_array()
-                .map(|rows| {
-                    rows.iter()
-                        .filter_map(|row| {
-                            let name = row["name"].as_str()?;
-                            let state = if row["ok"].as_bool().unwrap_or(false) {
-                                "通过"
-                            } else {
-                                "需要修复"
-                            };
-                            let message = row["detail"].as_str().unwrap_or_default();
-                            Some(format!("{name}：{state}（{message}）"))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .filter(|text| !text.is_empty())
-                .unwrap_or_else(|| "没有可用诊断信息".into());
-            set_detail(weak, detail);
-        }
-        Err(err) => set_detail(weak, format!("读取诊断失败：{err:#}")),
-    });
-}
-
-fn update_window(weak: slint::Weak<MainWindow>, message: String, paths: Arc<AppPaths>) {
-    set_detail(weak.clone(), message);
-    refresh_async(paths, weak);
-}
-
-fn set_operation_busy(weak: slint::Weak<MainWindow>, busy: bool) {
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(window) = weak.upgrade() {
-            window.set_operation_busy(busy);
-            if busy {
-                window.set_trust_candidate_visible(false);
-                window.set_trust_candidate_ip("".into());
-            }
-        }
-    });
-}
-
-fn set_detail(weak: slint::Weak<MainWindow>, message: String) {
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(window) = weak.upgrade() {
-            window.set_detail_text(message.into());
-        }
-    });
-}
-
-fn apply_snapshot(
-    weak: &slint::Weak<MainWindow>,
-    value: &Value,
-    allow_trust_candidate: bool,
-    expected_proxy: Option<&str>,
-) -> String {
-    let runtime = &value["runtime"];
-    let status = runtime["status"].as_str().unwrap_or("unknown");
-    let detail = runtime["detail"].as_str().unwrap_or("后台已启动");
-    let allowed = runtime["allowed"].as_bool().unwrap_or(false);
-    let protection = value["config"]["protection"]["enabled"]
-        .as_bool()
-        .unwrap_or(false);
-    let proxy = &value["proxy"];
-    let mihomo = proxy["mihomo"]["detail"]
-        .as_str()
-        .or_else(|| proxy["detail"].as_str())
-        .unwrap_or("出口待检测");
-    let config_matches = proxy["config_matches"].as_bool().unwrap_or(false);
-    let provider = proxy["auth_kind"].as_str().unwrap_or("未接管");
-    let legacy_needed = value["legacy_provider"]["needed"]
-        .as_bool()
-        .unwrap_or(false);
-    let setup_needed = !config_matches || legacy_needed;
-    let status_text = match (protection, allowed, status) {
-        (true, true, _) => "已保护",
-        (true, false, "blocked") => "已阻断",
-        (true, false, _) => "等待检测",
-        (false, _, _) => "尚未开启保护",
-    };
-    let route_text = format!(
-        "{}；出口：{}",
-        mihomo,
-        if allowed { "检测通过" } else { "待检测" }
-    );
-    let codex_text = if legacy_needed {
-        let changes = value["legacy_provider"]["changes"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join("；")
-            })
-            .unwrap_or_else(|| "恢复原 provider 身份".into());
-        format!("检测到旧版 GPTGuard provider。配置差异：{changes}")
-    } else if config_matches {
-        format!("已接管，provider：{provider}")
-    } else {
-        let changes = value["takeover_preview"]["changes"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join("；")
-            })
-            .unwrap_or_default();
-        if changes.is_empty() {
-            "检测到未接管或需要修复的 Codex 配置".to_string()
+fn status_label(enabled: bool, runtime: &Value) -> (&'static str, bool, bool) {
+    if !enabled {
+        return if runtime["status"] == "error" {
+            ("保护已关闭，规则待清理", false, true)
         } else {
-            format!("待确认的 Codex 配置差异：{changes}")
+            ("尚未开启保护", false, false)
+        };
+    }
+    match runtime["status"].as_str() {
+        Some("error") => ("保护执行异常", false, true),
+        Some("blocked") => ("已阻断", false, true),
+        Some("offline") if !runtime["checked_at"].is_null() => ("无法确认出口", false, true),
+        Some("allowed") if runtime["allowed"] == true => ("已保护", true, false),
+        _ => ("正在核验出口", false, false),
+    }
+}
+
+fn changes(value: &Value) -> String {
+    value["changes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("，")
+}
+
+fn show_status(window: &MainWindow, snapshot: Result<Value>) {
+    let snapshot = snapshot.and_then(|value| {
+        anyhow::ensure!(
+            value["daemon_elevated"].is_boolean(),
+            "后台版本较旧。请关闭主窗口，从通知区退出 GPTGuard，再启动新版。"
+        );
+        Ok(value)
+    });
+    let value = match snapshot {
+        Ok(value) => value,
+        Err(err) => {
+            window.set_state_known(false);
+            window.set_status_text("后台未就绪".into());
+            window.set_detail_text(format!("{err:#}").into());
+            window.set_protection_healthy(false);
+            window.set_protection_problem(true);
+            window.set_trust_candidate_ip("".into());
+            return;
         }
     };
-    let trust_candidate_ip = if allow_trust_candidate {
-        trust_candidate_ip(value, expected_proxy).unwrap_or_default()
+    let protection = &value["config"]["protection"];
+    let runtime = &value["runtime"];
+    let enabled = protection["enabled"] == true;
+    let (label, healthy, problem) = status_label(enabled, runtime);
+    window.set_state_known(true);
+    window.set_protection_enabled(enabled);
+    window.set_protection_healthy(healthy);
+    window.set_protection_problem(problem);
+    window.set_status_text(label.into());
+    let whitelist = protection["whitelist"].as_array().map_or(0, Vec::len);
+    let detail = if enabled || problem {
+        runtime["detail"].as_str().unwrap_or("正在核验出口").into()
+    } else if whitelist == 0 {
+        "首次开启会查找 Clash Verge，并请你确认检测到的出口 IP。".to_string()
     } else {
-        String::new()
+        format!("已保存 {whitelist} 条出口白名单规则。")
     };
-    let weak = weak.clone();
-    let _ = slint::invoke_from_event_loop({
-        let status_text = status_text.to_string();
-        let detail = detail.to_string();
-        let route_text = route_text.clone();
-        let codex_text = codex_text.clone();
-        let takeover_label = if legacy_needed {
+    window.set_detail_text(detail.into());
+    let local = value["local_proxy"].as_str();
+    if whitelist != 0 || local != Some(window.get_trust_candidate_proxy().as_str()) {
+        window.set_trust_candidate_ip("".into());
+    }
+    let route = if let Some(proxy) = local {
+        format!("Clash Verge  ·  {}", proxy.trim_end_matches('/'))
+    } else if value["proxy"]["mihomo"]["enabled"] == true {
+        value["proxy"]["mihomo"]["detail"]
+            .as_str()
+            .unwrap_or("使用内置 Mihomo")
+            .into()
+    } else {
+        let count = value["config"]["codex"]["route_count"]
+            .as_u64()
+            .unwrap_or(0);
+        if count == 0 {
+            "尚未配置代理出口".into()
+        } else {
+            format!("已配置 {count} 个出口")
+        }
+    };
+    window.set_route_text(route.into());
+    let legacy = value["legacy_provider"]["needed"] == true;
+    let matches = value["proxy"]["config_matches"] == true;
+    window.set_setup_needed(legacy || !matches);
+    window.set_takeover_label(
+        if legacy {
             "修复 Codex"
         } else {
             "确认接管配置"
-        };
-        let trust_candidate_ip = trust_candidate_ip.clone();
-        move || {
-            if let Some(window) = weak.upgrade() {
-                window.set_status_text(status_text.into());
-                window.set_detail_text(detail.into());
-                window.set_route_text(route_text.into());
-                window.set_codex_text(codex_text.into());
-                window.set_protection_enabled(protection);
-                window.set_setup_needed(setup_needed);
-                window.set_takeover_label(takeover_label.into());
-                window.set_trust_candidate_visible(!trust_candidate_ip.is_empty());
-                window.set_trust_candidate_ip(trust_candidate_ip.into());
-            }
         }
-    });
-    String::new()
+        .into(),
+    );
+    let codex = if legacy {
+        format!("旧版配置需要修复。{}", changes(&value["legacy_provider"]))
+    } else if matches {
+        "Codex 已连接本地网关。".into()
+    } else {
+        format!(
+            "接管后将应用以下改动。{}",
+            changes(&value["takeover_preview"])
+        )
+    };
+    window.set_codex_text(codex.into());
+    let doctor = value["doctor"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let name = row["name"].as_str()?;
+            let state = if row["ok"] == true {
+                "通过"
+            } else if name == "登录自启动" {
+                "未启用（可选）"
+            } else {
+                "待处理"
+            };
+            Some(format!(
+                "{name} · {state}    {}",
+                row["detail"].as_str().unwrap_or("")
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    window.set_doctor_text(doctor.into());
 }
 
-fn trust_candidate_ip(value: &Value, expected_proxy: Option<&str>) -> Option<String> {
-    let expected_proxy = expected_proxy?;
-    if !value["config"]["protection"]["whitelist"]
-        .as_array()
-        .is_some_and(|entries| entries.is_empty())
-    {
-        return None;
-    }
-    if !value["runtime"]["detected"].as_bool().unwrap_or(false) {
-        return None;
-    }
-    let ip = value["runtime"]["http_ip"]
-        .as_str()?
-        .parse::<IpAddr>()
-        .ok()?;
-    if ip.is_loopback() || ip.is_unspecified() {
-        return None;
-    }
-    let routes = value["config"]["codex"]["routes"].as_array()?;
-    let enabled = routes
-        .iter()
-        .filter(|route| route["enabled"].as_bool().unwrap_or(false))
-        .collect::<Vec<_>>();
-    if enabled.len() != 1 || enabled[0]["url"].as_str()? != expected_proxy {
-        return None;
-    }
-    Some(ip.to_string())
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct ApiFailure {
+    code: String,
+    message: String,
+}
+
+fn api_code(err: &anyhow::Error) -> Option<&str> {
+    err.downcast_ref::<ApiFailure>()
+        .map(|failure| failure.code.as_str())
 }
 
 fn fetch_status(paths: &AppPaths) -> Result<Value> {
-    let config = Config::load_or_create(paths)?;
-    let url = format!("http://127.0.0.1:{}/api/status", config.ui.web_port);
-    let token = config.ui.admin_token.clone();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("create UI request runtime")?;
-    runtime.block_on(async move {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(5))
-            .build()?;
-        let response = client
-            .get(url)
-            .header("x-gptguard-token", token)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            anyhow::bail!("后台返回 HTTP {}", response.status());
-        }
-        Ok(response.json().await?)
-    })
+    request(paths, "/api/status", None)
 }
 
 fn post_api(paths: &AppPaths, endpoint: &str, body: Value) -> Result<Value> {
+    request(paths, endpoint, Some(body))
+}
+
+fn request(paths: &AppPaths, endpoint: &str, body: Option<Value>) -> Result<Value> {
     let config = Config::load_or_create(paths)?;
     let url = format!("http://127.0.0.1:{}{endpoint}", config.ui.web_port);
-    let token = config.ui.admin_token.clone();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()
-        .context("create UI request runtime")?;
-    runtime.block_on(async move {
+        .build()?;
+    runtime.block_on(async {
         let client = reqwest::Client::builder()
             .no_proxy()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(if body.is_some() { 90 } else { 5 }))
             .build()?;
-        let response = client
-            .post(url)
-            .header("x-gptguard-token", token)
-            .json(&body)
+        let request = match body {
+            None => client.get(url),
+            Some(body) => client.post(url).json(&body),
+        };
+        let response = request
+            .header("x-gptguard-token", &config.ui.admin_token)
             .send()
-            .await?;
+            .await
+            .context("无法连接 GPTGuard 后台")?;
         let status = response.status();
-        let body = response.text().await?;
-        let value: Value = serde_json::from_str(&body).context("解析后台响应")?;
+        let value: Value = response.json().await.context("读取后台响应失败")?;
         if !status.is_success() {
-            let message = value["error"]["message"]
-                .as_str()
-                .unwrap_or("后台拒绝了请求");
-            anyhow::bail!("后台返回 HTTP {}：{message}", status);
+            return Err(ApiFailure {
+                code: value["error"]["code"].as_str().unwrap_or("").into(),
+                message: value["error"]["message"]
+                    .as_str()
+                    .unwrap_or("后台拒绝了请求")
+                    .into(),
+            }
+            .into());
         }
         Ok(value)
     })

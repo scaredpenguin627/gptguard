@@ -21,6 +21,7 @@
 | 项目 | 类型 | 内容 | 状态 | 落点 |
 |---|---|---|---|---|
 | PR #1 / issue #1，`5ee2eac` | 其他人的代码 | Windows 通知区托盘、中文菜单、登录启动、单实例 | 已合入 | `src/tray.rs`、`src/guard.rs` 的 `set_autostart`、`tray.lock` |
+| PR #1，`cba94fa`（11 月 15 日合并） | 修复 | 保留正在防护的后台，丢弃旧配置的检测结果 | 部分合入 | v0.4.5 在 Rust 后台复核出口策略，管理员启动只接替尚未开启保护的普通权限后台。[上游改动](https://github.com/keii-2596/ClaudeGuard/commit/cba94fa1) |
 | 文档缺口 | 功能 | Windows 端自动更新锁定 | 已合入 | `src/guard.rs` 的 `update_lock` / `remove_update_lock` |
 | 文档缺口 | 功能 | Windows 端固定模型 | 已合入 | `src/codex/config_tx.rs`、`gptguard model` |
 | 上游 macOS 菜单栏 | 功能 | AppKit 菜单栏与 Swift 守护 | 未合入 | 新项目用跨平台托盘代替；macOS 托盘本轮不提供 |
