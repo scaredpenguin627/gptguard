@@ -45,11 +45,13 @@ export component MainWindow inherits Window {
     private property <bool> show_doctor: false;
     private property <bool> show_about: false;
     private property <bool> ready: root.state_known && !root.operation_busy;
+    private property <bool> confirming_activation: root.trust_candidate_ip != "" && root.activate_after_trust && !root.protection_enabled;
 
     init => { Palette.color-scheme = ColorScheme.light; }
     callback refresh_clicked();
     callback connect_local_clicked();
     callback trust_local_exit_clicked(string, string, bool);
+    callback cancel_confirmation();
     callback import_clicked(string);
     callback file_clicked();
     callback add_exit_clicked(string);
@@ -84,16 +86,19 @@ export component MainWindow inherits Window {
                     spacing: 7px;
                     HorizontalLayout {
                         spacing: 12px;
-                        Heading { text: root.status_text; vertical-alignment: center; horizontal-stretch: 1; font-size: 22px; }
+                        Heading { text: root.confirming_activation ? "等待确认出口" : root.status_text; vertical-alignment: center; horizontal-stretch: 1; font-size: 22px; }
                         protection := Button {
-                            text: root.protection_enabled ? "关闭严格保护" : "开启严格保护";
-                            primary: !root.protection_enabled;
+                            text: root.confirming_activation ? "取消确认" : root.protection_enabled ? "关闭严格保护" : "开启严格保护";
+                            primary: !root.protection_enabled && !root.confirming_activation;
                             height: 36px;
                             enabled: root.ready;
-                            clicked => { root.protection_clicked(!root.protection_enabled); }
+                            clicked => {
+                                if root.confirming_activation { root.cancel_confirmation(); }
+                                else { root.protection_clicked(!root.protection_enabled); }
+                            }
                         }
                     }
-                    BodyText { text: root.detail_text; }
+                    BodyText { text: root.confirming_activation ? "严格保护尚未开启。" : root.detail_text; }
                     if root.action_text != "": BodyText {
                         text: root.action_text;
                         font-weight: 600;

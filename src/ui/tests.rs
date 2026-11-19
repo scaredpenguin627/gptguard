@@ -150,6 +150,11 @@ fn protection_buttons_confirm_the_exit_and_show_the_daemons_actual_state() {
     assert_eq!(state.lock().unwrap().activation_requests, 1);
     show_status(&window, fetch_status(&paths));
     assert_eq!(window.get_trust_candidate_ip(), IP);
+    click(&window, "取消确认");
+    assert!(!state.lock().unwrap().trusted && !window.get_protection_enabled());
+    assert!(window.get_trust_candidate_ip().is_empty());
+    click(&window, "开启严格保护");
+    wait_for_action(&window);
     state.lock().unwrap().exit_changed = true;
     let confirm = format!("信任并开启保护 · {IP}");
     click(&window, &confirm);

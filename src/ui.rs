@@ -160,6 +160,13 @@ pub fn run() -> Result<()> {
 }
 
 fn bind_actions(window: &MainWindow, ui: &Ui) {
+    let weak = window.as_weak();
+    window.on_cancel_confirmation(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_trust_candidate_ip("".into());
+            window.set_action_text("已取消出口确认。".into());
+        }
+    });
     let action = ui.clone();
     window.on_refresh_clicked(move || {
         action.action("正在检测实际出口…", |paths| {
@@ -313,8 +320,13 @@ fn check_exit(paths: &AppPaths, activate: bool) -> Result<ActionResult> {
 }
 
 fn ensure_daemon(paths: &AppPaths) -> Result<()> {
-    util::spawn_detached(&util::exe_path(), &["--cli", "tray", "--start-guard"])?;
+    // A tray may already own its lock even if its worker stopped. Launch the
+    // worker with the window's token and wait for its authenticated API first.
+    if !service::daemon_running(paths) {
+        util::spawn_detached(&util::exe_path(), &["--cli", "run"])?;
+    }
     let status = wait_for_api(paths)?;
+    util::spawn_detached(&util::exe_path(), &["--cli", "tray", "--start-guard"])?;
     upgrade_idle_daemon(paths, &status)
 }
 
@@ -335,7 +347,8 @@ fn upgrade_idle_daemon(paths: &AppPaths, status: &Value) -> Result<()> {
 }
 
 fn wait_for_api(paths: &AppPaths) -> Result<Value> {
-    for _ in 0..50 {
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < until {
         if service::daemon_running(paths) {
             if let Ok(snapshot) = fetch_status(paths) {
                 return Ok(snapshot);
