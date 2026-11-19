@@ -1,7 +1,10 @@
 fn main() {
     println!("cargo:rerun-if-changed=ui/main.slint");
     println!("cargo:rerun-if-env-changed=GPTGUARD_MIHOMO_PATH");
-    slint_build::compile("ui/main.slint").expect("compile Slint UI");
+    // Slint's UI test driver uses element metadata to find and activate the
+    // same labelled buttons that are shipped in the installer.
+    let ui = slint_build::CompilerConfiguration::new().with_debug_info(true);
+    slint_build::compile_with_config("ui/main.slint", ui).expect("compile Slint UI");
 
     // Release builds provide the official Windows Mihomo executable through
     // GPTGUARD_MIHOMO_PATH.  Developer builds still compile without network

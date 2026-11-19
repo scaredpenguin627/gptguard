@@ -412,13 +412,23 @@ fn show_status(window: &MainWindow, snapshot: Result<Value>) {
     let runtime = &value["runtime"];
     let enabled = protection["enabled"] == true;
     let (label, healthy, problem) = status_label(enabled, runtime);
+    let matches = value["proxy"]["config_matches"] == true;
     window.set_state_known(true);
     window.set_protection_enabled(enabled);
     window.set_protection_healthy(healthy);
     window.set_protection_problem(problem);
-    window.set_status_text(label.into());
+    window.set_status_text(
+        if healthy && !matches {
+            "出口已通过，Codex 待接管"
+        } else {
+            label
+        }
+        .into(),
+    );
     let whitelist = protection["whitelist"].as_array().map_or(0, Vec::len);
-    let detail = if enabled || problem {
+    let detail = if healthy && !matches {
+        "严格保护已开启。要让 Codex 使用这个出口，请在下方确认接管配置。".to_string()
+    } else if enabled || problem {
         runtime["detail"].as_str().unwrap_or("正在核验出口").into()
     } else if whitelist == 0 {
         "首次开启会查找 Clash Verge，并请你确认检测到的出口 IP。".to_string()
@@ -449,7 +459,6 @@ fn show_status(window: &MainWindow, snapshot: Result<Value>) {
     };
     window.set_route_text(route.into());
     let legacy = value["legacy_provider"]["needed"] == true;
-    let matches = value["proxy"]["config_matches"] == true;
     window.set_setup_needed(legacy || !matches);
     window.set_takeover_label(
         if legacy {
