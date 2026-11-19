@@ -411,9 +411,14 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
 pub fn doctor(config: &Config) -> Vec<(String, bool, String)> {
     let mut rows = Vec::new();
     rows.push((
-        "管理员权限".into(),
+        "后台管理员权限".into(),
         util::is_elevated(),
-        "hosts、防火墙和更新锁需要管理员权限；普通权限只能做进程终止与启动前检查".into(),
+        if util::is_elevated() {
+            "后台可管理 hosts 和防火墙"
+        } else {
+            "关闭主窗口，从通知区退出 GPTGuard，再右键选择“以管理员身份运行”"
+        }
+        .into(),
     ));
     let hosts = hosts_path();
     rows.push((

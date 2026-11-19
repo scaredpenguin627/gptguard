@@ -1,5 +1,5 @@
 #define AppName "GPTGuard"
-#define AppVersion "0.4.4"
+#define AppVersion "0.4.5"
 #define AppPublisher "GPTGuard"
 #define AppExeName "GPTGuard.exe"
 

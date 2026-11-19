@@ -75,13 +75,32 @@ pub fn is_elevated() -> bool {
     *ELEVATED.get_or_init(|| {
         #[cfg(windows)]
         {
-            Command::new("net")
-                .arg("session")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
+            use std::mem::size_of;
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::Security::{
+                GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+            };
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+            // Query this process's primary token. Checking "net session" also
+            // depends on the unrelated Windows Server service being available.
+            unsafe {
+                let mut token = std::ptr::null_mut();
+                if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                    return false;
+                }
+                let mut elevation = TOKEN_ELEVATION::default();
+                let mut written = 0;
+                let ok = GetTokenInformation(
+                    token,
+                    TokenElevation,
+                    (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                    size_of::<TOKEN_ELEVATION>() as u32,
+                    &mut written,
+                );
+                CloseHandle(token);
+                ok != 0 && elevation.TokenIsElevated != 0
+            }
         }
         #[cfg(unix)]
         {

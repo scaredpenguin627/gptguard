@@ -1,6 +1,7 @@
 //! Daemon orchestration: egress loop, Codex relay, panel and shared state.
 
 use std::fs::{self, OpenOptions};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -45,6 +46,9 @@ pub struct AppState {
     /// Last applied block/allow decision and its report. Reapplying `netsh`
     /// every three seconds would churn firewall rules for no reason.
     pub last_enforcement: Arc<std::sync::Mutex<Option<(bool, EnforcementReport)>>>,
+    evaluation: Arc<tokio::sync::Mutex<()>>,
+    recheck: Arc<tokio::sync::Notify>,
+    restarting_idle: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -57,10 +61,51 @@ impl AppState {
     }
 
     pub fn save_config(&self, cfg: &Config) -> Result<()> {
+        let mut current = self.config.write().unwrap();
+        self.persist_config(cfg, &mut current)
+    }
+
+    /// Apply a change against the current configuration while holding the
+    /// write lock, including when a caller has been awaiting an exit check.
+    pub fn update_config(&self, edit: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
+        let mut current = self.config.write().unwrap();
+        let mut next = current.clone();
+        edit(&mut next)?;
+        self.persist_config(&next, &mut current)
+    }
+
+    fn persist_config(&self, cfg: &Config, current: &mut Config) -> Result<()> {
+        anyhow::ensure!(
+            !self.restarting_idle.load(Ordering::Acquire),
+            "后台正在重启，请稍后重试。"
+        );
         self.proxy.check_reload(cfg)?;
         cfg.save(&self.paths)?;
-        *self.config.write().unwrap() = cfg.clone();
-        self.proxy.reload(cfg.clone())?;
+        if let Err(err) = self.proxy.reload(cfg.clone()) {
+            current.save(&self.paths).context("恢复上一次生效的配置")?;
+            return Err(err);
+        }
+        if !current.same_egress_policy(cfg) {
+            let mut runtime = self.runtime.write().unwrap();
+            runtime.status = if cfg.protection.enabled {
+                Verdict::Offline
+            } else {
+                Verdict::Disabled
+            };
+            runtime.detail = if cfg.protection.enabled {
+                "正在核验出口"
+            } else {
+                "防护已关闭"
+            }
+            .into();
+            runtime.detected = false;
+            runtime.allowed = false;
+            runtime.http_ip = None;
+            runtime.stun_ip = None;
+            runtime.checked_at = None;
+            self.recheck.notify_one();
+        }
+        *current = cfg.clone();
         Ok(())
     }
 
@@ -99,6 +144,18 @@ impl AppState {
 
     pub fn request_shutdown(&self) {
         self.shutdown.notify_one();
+    }
+
+    pub fn request_idle_restart(&self) -> bool {
+        // Serialize the decision with activation. Once a restart is accepted,
+        // this daemon must not accept a new activation before releasing its lock.
+        let cfg = self.config.write().unwrap();
+        if cfg.protection.enabled || util::is_elevated() {
+            return false;
+        }
+        self.restarting_idle.store(true, Ordering::Release);
+        self.request_shutdown();
+        true
     }
 }
 
@@ -151,6 +208,9 @@ pub async fn run(config: Config, paths: AppPaths, open_panel: bool) -> Result<()
         shutdown: shutdown.clone(),
         started_at,
         last_enforcement: Arc::new(std::sync::Mutex::new(None)),
+        evaluation: Default::default(),
+        recheck: Default::default(),
+        restarting_idle: Default::default(),
     };
     state.write_state();
 
@@ -174,7 +234,7 @@ pub async fn run(config: Config, paths: AppPaths, open_panel: bool) -> Result<()
 
     let (web_tx, web_rx) = tokio::sync::oneshot::channel::<()>();
     let web_state = state.clone();
-    let web_task = tokio::spawn(async move {
+    let mut web_task = tokio::spawn(async move {
         if let Err(err) = web::serve(web_state, async {
             let _ = web_rx.await;
         })
@@ -202,7 +262,12 @@ pub async fn run(config: Config, paths: AppPaths, open_panel: bool) -> Result<()
     let _ = web_tx.send(());
     guard_task.abort();
     proxy_task.abort();
-    web_task.abort();
+    if tokio::time::timeout(Duration::from_secs(2), &mut web_task)
+        .await
+        .is_err()
+    {
+        web_task.abort();
+    }
     proxy.shutdown();
 
     // Do not leave a dead daemon's block behind. Update locking is separate and
@@ -224,13 +289,12 @@ pub async fn run(config: Config, paths: AppPaths, open_panel: bool) -> Result<()
 
 async fn guard_loop(state: AppState) {
     loop {
-        let cfg = state.config();
-        if cfg.protection.enabled {
-            evaluate_once(&state, false).await;
-        } else {
-            mark_disabled(&state, &cfg);
+        evaluate_once(&state, false).await;
+        let interval = state.config().protection.interval_seconds.max(1);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
+            _ = state.recheck.notified() => {}
         }
-        tokio::time::sleep(Duration::from_secs(cfg.protection.interval_seconds.max(1))).await;
     }
 }
 
@@ -245,7 +309,7 @@ fn apply_enforcement(
         .as_ref()
         .map(|(previous, _)| *previous == block)
         .unwrap_or(false);
-    if !force && unchanged {
+    if !force && unchanged && cache.as_ref().is_some_and(|(_, report)| report.ok()) {
         return cache.as_ref().unwrap().1.clone();
     }
     let report = guard::enforce(cfg, block);
@@ -254,23 +318,41 @@ fn apply_enforcement(
 }
 
 fn mark_disabled(state: &AppState, cfg: &Config) {
-    {
+    let enforcement = {
         let mut cache = state.last_enforcement.lock().unwrap();
-        if cache.as_ref().is_some_and(|(blocked, _)| *blocked) {
-            let _ = guard::enforce(cfg, false);
+        let report = if cache
+            .as_ref()
+            .is_some_and(|(blocked, previous)| *blocked || !previous.ok())
+        {
+            guard::enforce(cfg, false)
+        } else {
+            EnforcementReport {
+                elevated: util::is_elevated(),
+                ..Default::default()
+            }
+        };
+        if report.ok() {
+            *cache = None;
+        } else {
+            *cache = Some((false, report.clone()));
         }
-        *cache = None;
-    }
+        report
+    };
     let mut runtime = state.runtime();
-    runtime.status = Verdict::Disabled;
+    runtime.status = if enforcement.ok() {
+        Verdict::Disabled
+    } else {
+        Verdict::Error
+    };
     runtime.detected = false;
     runtime.allowed = false;
-    runtime.detail = "防护已关闭".into();
-    runtime.checked_at = Some(util::now_iso());
-    runtime.enforcement = EnforcementReport {
-        elevated: util::is_elevated(),
-        ..Default::default()
+    runtime.detail = if enforcement.ok() {
+        "防护已关闭".into()
+    } else {
+        format!("系统规则尚未解除：{}", enforcement.errors.join("，"))
     };
+    runtime.checked_at = Some(util::now_iso());
+    runtime.enforcement = enforcement;
     runtime.codex = state.proxy.status();
     runtime.update_locked = cfg.update_lock.enabled;
     *state.runtime.write().unwrap() = runtime;
@@ -278,19 +360,34 @@ fn mark_disabled(state: &AppState, cfg: &Config) {
 }
 
 async fn evaluate_once(state: &AppState, manual: bool) -> RuntimeState {
+    let _evaluation = state.evaluation.lock().await;
     let cfg = state.config();
     if !cfg.protection.enabled && !manual {
-        mark_disabled(state, &cfg);
+        let current = state.config.read().unwrap();
+        if !current.protection.enabled {
+            mark_disabled(state, &current);
+        }
         return state.runtime();
     }
     let started = std::time::Instant::now();
     let report = state.proxy.check_egress(&cfg).await;
+    let current = state.config.read().unwrap();
+    if !cfg.same_egress_policy(&current) {
+        return state.runtime();
+    }
     // A manual wizard check is allowed to probe an exit before the user turns
     // protection on, but it must never install a block while protection is
     // disabled.  Background checks remain strict and fail closed.
     let block = cfg.protection.enabled && (cfg.protection.proxy_only || !report.allowed);
-    let enforcement = apply_enforcement(state, &cfg, block, manual);
-    if cfg.protection.proxy_only && !report.allowed && cfg.protection.kill_on_block {
+    let enforcement = if cfg.protection.enabled {
+        apply_enforcement(state, &cfg, block, manual)
+    } else {
+        EnforcementReport {
+            elevated: util::is_elevated(),
+            ..Default::default()
+        }
+    };
+    if block && cfg.protection.proxy_only && !report.allowed && cfg.protection.kill_on_block {
         // Keep the app from continuing with a direct connection while the
         // firewall rule is being refreshed.
         let killed = guard::target_paths(&cfg);
@@ -311,7 +408,7 @@ async fn evaluate_once(state: &AppState, manual: bool) -> RuntimeState {
     } else {
         Verdict::Offline
     };
-    if !enforcement.errors.is_empty() && (status != Verdict::Allowed || cfg.protection.proxy_only) {
+    if !enforcement.errors.is_empty() {
         status = Verdict::Error;
     }
     let mut detail = report.detail.clone();

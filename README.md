@@ -4,14 +4,14 @@ GPTGuard 是一个 Windows 出口保护工具。它把 Codex 的请求固定到�
 
 ## 小白怎么用
 
-Release 页面只需要下载一个文件：`GPTGuard-Setup-v0.4.4-windows-x64.exe`。
+从 GitHub Release 下载 `GPTGuard-Setup-v0.4.5-windows-x64.exe`。
 
 1. 双击安装器。
-2. 启动 GPTGuard，点击“一键连接 Clash Verge”。GPTGuard 会扫描正在运行的 Clash Verge / Mihomo，并验证代理握手。
-3. 连接成功后，GPTGuard 会检测公网出口 IP。首次使用时，确认“信任此出口 <IP>”，再继续。
-4. 查看 Codex 配置差异并点击“确认接管配置”。
-5. 点击“开启严格保护”。以后 GPTGuard 会在通知区运行。
-6. 如果没有检测到本机代理，再粘贴订阅地址，或选择 YAML、URI、Base64 节点文件。
+2. 启动 Clash Verge，选好节点。右键 GPTGuard，选择“以管理员身份运行”。
+3. 点击“开启严格保护”。首次使用时，GPTGuard 会查找本机代理并测量出口 IP。
+4. 核对显示的 IP，点击“信任并开启保护”。GPTGuard 会再次检测，出口匹配后才保存白名单。主界面会显示保护结果。
+5. 要让 Codex 使用网关，在“Codex 网关”查看配置改动，然后点击“确认接管配置”。
+6. 使用订阅或节点文件时，展开“其他连接方式”，导入节点并填写已知的可信出口 IP 或 CIDR 网段。
 
 ## 协议节点
 

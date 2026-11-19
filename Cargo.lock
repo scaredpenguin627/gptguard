@@ -1812,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "gptguard"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1825,6 +1825,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "http",
+ "i-slint-backend-testing",
  "ipnet",
  "libc",
  "open",
@@ -2114,6 +2115,18 @@ dependencies = [
  "i-slint-core",
  "i-slint-core-macros",
  "i-slint-renderer-femtovg",
+]
+
+[[package]]
+name = "i-slint-backend-testing"
+version = "1.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01943d6c5ea5bc913d497bdaa423c309e7627afff47a6794bfd13be5c564209f"
+dependencies = [
+ "cfg_aliases",
+ "i-slint-common",
+ "i-slint-core",
+ "vtable",
 ]
 
 [[package]]
