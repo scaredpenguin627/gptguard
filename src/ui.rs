@@ -7,9 +7,10 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde_json::{json, Value};
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Model};
 
 use crate::config::{AppPaths, Config};
+use crate::desktop::{DesktopSession, QUIT_POLL};
 use crate::{service, util};
 
 slint::include_modules!();
@@ -22,6 +23,7 @@ struct ActionResult {
     message: String,
     candidate: Option<(String, String)>,
     activate_after_trust: bool,
+    clear_whitelist_input: bool,
 }
 
 impl ActionResult {
@@ -36,6 +38,7 @@ impl ActionResult {
 #[derive(Clone)]
 struct Ui {
     paths: Arc<AppPaths>,
+    desktop: DesktopSession,
     window: slint::Weak<MainWindow>,
     revision: Arc<AtomicU64>,
     polling: Arc<AtomicBool>,
@@ -47,7 +50,7 @@ impl Ui {
     fn action(
         &self,
         progress: &str,
-        run: impl FnOnce(&AppPaths) -> Result<ActionResult> + Send + 'static,
+        run: impl FnOnce(&AppPaths, &DesktopSession) -> Result<ActionResult> + Send + 'static,
     ) {
         let Some(window) = self.window.upgrade() else {
             return;
@@ -62,7 +65,7 @@ impl Ui {
         window.set_trust_candidate_ip("".into());
         let ui = self.clone();
         std::thread::spawn(move || {
-            let result = run(&ui.paths);
+            let result = run(&ui.paths, &ui.desktop);
             let snapshot = fetch_status(&ui.paths);
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(window) = ui.window.upgrade() else {
@@ -71,6 +74,9 @@ impl Ui {
                 match &result {
                     Ok(outcome) => {
                         window.set_action_text(outcome.message.as_str().into());
+                        if outcome.clear_whitelist_input {
+                            window.set_whitelist_input("".into());
+                        }
                         if let Some((proxy, ip)) = &outcome.candidate {
                             window.set_trust_candidate_proxy(proxy.as_str().into());
                             window.set_trust_candidate_ip(ip.as_str().into());
@@ -113,6 +119,12 @@ impl Ui {
 
 pub fn run() -> Result<()> {
     let paths = AppPaths::discover();
+    run_with_paths(paths)
+}
+
+/// Run the desktop window for the supplied configuration and data directories.
+pub fn run_with_paths(paths: AppPaths) -> Result<()> {
+    let desktop = DesktopSession::join(&paths)?;
     paths.ensure()?;
     util::init_logging(&paths.log_dir)?;
     let lock_file = std::fs::OpenOptions::new()
@@ -126,7 +138,7 @@ pub fn run() -> Result<()> {
         // An explicitly elevated second launch can supply the worker to the
         // existing window. An active guard is never restarted for elevation.
         if cfg!(windows) && util::is_elevated() {
-            upgrade_idle_daemon(&paths, &fetch_status(&paths)?)?;
+            upgrade_idle_daemon(&paths, &fetch_status(&paths)?, &desktop)?;
         }
         return Ok(());
     }
@@ -141,13 +153,14 @@ pub fn run() -> Result<()> {
     );
     let ui = Ui {
         paths: Arc::new(paths),
+        desktop: desktop.clone(),
         window: window.as_weak(),
         revision: Default::default(),
         polling: Default::default(),
     };
     bind_actions(&window, &ui);
-    ui.action("正在连接 GPTGuard 后台…", |paths| {
-        ensure_daemon(paths)?;
+    ui.action("正在连接 GPTGuard 后台…", |paths, session| {
+        ensure_daemon(paths, session)?;
         Ok(ActionResult::default())
     });
     let timer = slint::Timer::default();
@@ -156,7 +169,18 @@ pub fn run() -> Result<()> {
         Duration::from_secs(3),
         move || ui.poll(),
     );
+    let _quit_timer = watch_tray_exit(desktop);
     window.run().context("run native window")
+}
+
+fn watch_tray_exit(desktop: DesktopSession) -> slint::Timer {
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, QUIT_POLL, move || {
+        if desktop.exit_requested() {
+            let _ = slint::quit_event_loop();
+        }
+    });
+    timer
 }
 
 fn bind_actions(window: &MainWindow, ui: &Ui) {
@@ -169,15 +193,16 @@ fn bind_actions(window: &MainWindow, ui: &Ui) {
     });
     let action = ui.clone();
     window.on_refresh_clicked(move || {
-        action.action("正在检测实际出口…", |paths| {
+        action.action("正在检测实际出口…", |paths, _| {
             check_exit(paths, false)
         })
     });
     let action = ui.clone();
     window.on_connect_local_clicked(move || {
-        action.action("正在查找 Clash Verge 并检测出口…", |paths| {
-            connect_and_check(paths, false)
-        })
+        action.action(
+            "正在查找 Clash Verge 并检测出口…",
+            |paths, desktop| connect_and_check(paths, false, desktop),
+        )
     });
     let action = ui.clone();
     window.on_protection_clicked(move |enabled| {
@@ -187,9 +212,9 @@ fn bind_actions(window: &MainWindow, ui: &Ui) {
             } else {
                 "正在关闭严格保护…"
             },
-            move |paths| match change_protection(paths, enabled) {
+            move |paths, desktop| match change_protection(paths, enabled) {
                 Err(err) if enabled && api_code(&err) == Some("whitelist_required") => {
-                    connect_and_check(paths, true)
+                    connect_and_check(paths, true, desktop)
                 }
                 result => result,
             },
@@ -198,7 +223,7 @@ fn bind_actions(window: &MainWindow, ui: &Ui) {
     let action = ui.clone();
     window.on_trust_local_exit_clicked(move |ip, proxy, enable| {
         let (ip, proxy) = (ip.to_string(), proxy.to_string());
-        action.action("正在重新核对出口 IP…", move |paths| {
+        action.action("正在重新核对出口 IP…", move |paths, _| {
             post_api(
                 paths,
                 "/api/codex/trust-local-exit",
@@ -215,35 +240,49 @@ fn bind_actions(window: &MainWindow, ui: &Ui) {
     let action = ui.clone();
     window.on_add_exit_clicked(move |entry| {
         let entry = entry.trim().to_string();
-        action.action("正在保存出口白名单…", move |paths| {
+        action.action("正在保存出口白名单…", move |paths, _| {
+            crate::config::parse_net(&entry)
+                .map_err(|_| anyhow::anyhow!("请输入有效的出口 IP 或 CIDR 网段。"))?;
             post_api(
                 paths,
                 "/api/whitelist",
                 json!({"entries":[entry], "append":true}),
             )?;
-            Ok(ActionResult::message(format!(
-                "已将 {entry} 加入出口白名单。"
-            )))
+            Ok(ActionResult {
+                clear_whitelist_input: true,
+                ..ActionResult::message(format!("已将 {entry} 加入出口白名单。"))
+            })
+        });
+    });
+    let action = ui.clone();
+    window.on_remove_exit_clicked(move |entry| {
+        let entry = entry.to_string();
+        action.action("正在删除选中的出口规则…", move |paths, _| {
+            post_api(paths, "/api/whitelist/remove", json!({"entry":entry}))?;
+            Ok(ActionResult::message(format!("已移除出口规则 {entry}。")))
         });
     });
     let action = ui.clone();
     window.on_import_clicked(move |subscription| {
         let url = subscription.trim().to_string();
-        action.action("正在导入订阅并检测出口…", move |paths| {
-            let response = post_api(paths, "/api/codex/subscription", json!({"url": url}))?;
-            restart_if_requested(paths, &response)?;
-            check_exit(paths, false)
-        });
+        action.action(
+            "正在导入订阅并检测出口…",
+            move |paths, desktop| {
+                let response = post_api(paths, "/api/codex/subscription", json!({"url": url}))?;
+                restart_if_requested(paths, &response, desktop)?;
+                check_exit(paths, false)
+            },
+        );
     });
     let action = ui.clone();
     window.on_file_clicked(move || {
-        let Some(file) = rfd::FileDialog::new()
-            .add_filter("节点文件", &["yaml", "yml", "txt"])
-            .pick_file()
-        else {
-            return;
-        };
-        action.action("正在导入文件并检测出口…", move |paths| {
+        action.action("请选择要导入的节点文件…", move |paths, desktop| {
+            let Some(file) = rfd::FileDialog::new()
+                .add_filter("节点文件", &["yaml", "yml", "txt"])
+                .pick_file()
+            else {
+                return Ok(ActionResult::default());
+            };
             let content = std::fs::read_to_string(&file).context("读取节点文件")?;
             let response = post_api(
                 paths,
@@ -253,20 +292,20 @@ fn bind_actions(window: &MainWindow, ui: &Ui) {
                     "content": content,
                 }),
             )?;
-            restart_if_requested(paths, &response)?;
+            restart_if_requested(paths, &response, desktop)?;
             check_exit(paths, false)
         });
     });
     let action = ui.clone();
     window.on_takeover_clicked(move || {
-        action.action("正在接管 Codex 配置…", |paths| {
+        action.action("正在接管 Codex 配置…", |paths, _| {
             post_api(paths, "/api/codex/takeover", json!({"auth": "unknown"}))?;
             Ok(ActionResult::message("Codex 配置已接管。"))
         })
     });
     let action = ui.clone();
     window.on_restore_clicked(move || {
-        action.action("正在恢复 Codex 配置…", |paths| {
+        action.action("正在恢复 Codex 配置…", |paths, _| {
             post_api(paths, "/api/codex/restore", json!({"force": true}))?;
             Ok(ActionResult::message(
                 "Codex 原配置已恢复。如有冲突，已保留副本。",
@@ -287,13 +326,17 @@ fn change_protection(paths: &AppPaths, enabled: bool) -> Result<ActionResult> {
     }))
 }
 
-fn connect_and_check(paths: &AppPaths, activate: bool) -> Result<ActionResult> {
+fn connect_and_check(
+    paths: &AppPaths,
+    activate: bool,
+    desktop: &DesktopSession,
+) -> Result<ActionResult> {
     let response = post_api(paths, "/api/codex/connect-local", json!({})).map_err(|err| {
         if activate {
-            err.context("开启保护前需要确认出口。请启动 Clash Verge 后重试，或在“其他连接方式”中填写已知的出口 IP")
+            err.context("开启保护前需要确认出口。请启动 Clash Verge 后重试，或在“管理白名单”中添加已知的可信出口")
         } else { err }
     })?;
-    restart_if_requested(paths, &response)?;
+    restart_if_requested(paths, &response, desktop)?;
     check_exit(paths, activate)
 }
 
@@ -305,6 +348,7 @@ fn check_exit(paths: &AppPaths, activate: bool) -> Result<ActionResult> {
             message: format!("检测到出口 {ip}。请核对它是否属于你信任的节点。"),
             candidate: Some((proxy.into(), ip.into())),
             activate_after_trust: activate,
+            ..Default::default()
         });
     }
     let detail = check["runtime"]["detail"]
@@ -314,30 +358,30 @@ fn check_exit(paths: &AppPaths, activate: bool) -> Result<ActionResult> {
         bail!("出口检测失败。请检查代理连接并重试。{detail}");
     }
     if activate {
-        bail!("尚未确认可信出口。请重新检测，或在“其他连接方式”中填写已知的出口 IP。");
+        bail!("尚未确认可信出口。请重新检测，或在“管理白名单”中添加已知的可信出口。");
     }
     Ok(ActionResult::message(detail))
 }
 
-fn ensure_daemon(paths: &AppPaths) -> Result<()> {
+fn ensure_daemon(paths: &AppPaths, desktop: &DesktopSession) -> Result<()> {
     // A tray may already own its lock even if its worker stopped. Launch the
     // worker with the window's token and wait for its authenticated API first.
     if !service::daemon_running(paths) {
-        util::spawn_detached(&util::exe_path(), &["--cli", "run"])?;
+        desktop.spawn(&["--cli", "run"])?;
     }
     let status = wait_for_api(paths)?;
-    util::spawn_detached(&util::exe_path(), &["--cli", "tray", "--start-guard"])?;
-    upgrade_idle_daemon(paths, &status)
+    desktop.spawn(&["--cli", "tray", "--start-guard"])?;
+    upgrade_idle_daemon(paths, &status, desktop)
 }
 
-fn upgrade_idle_daemon(paths: &AppPaths, status: &Value) -> Result<()> {
+fn upgrade_idle_daemon(paths: &AppPaths, status: &Value, desktop: &DesktopSession) -> Result<()> {
     if cfg!(windows)
         && util::is_elevated()
         && status["daemon_elevated"] == false
         && status["config"]["protection"]["enabled"] == false
     {
         let response = post_api(paths, "/api/restart-idle", json!({}))?;
-        restart_if_requested(paths, &response)?;
+        restart_if_requested(paths, &response, desktop)?;
         anyhow::ensure!(
             fetch_status(paths)?["daemon_elevated"] == true,
             "后台仍以普通权限运行。请从通知区退出 GPTGuard 后，以管理员身份重新启动。"
@@ -359,13 +403,17 @@ fn wait_for_api(paths: &AppPaths) -> Result<Value> {
     bail!("连接后台超时。请从通知区退出 GPTGuard 后重新启动。");
 }
 
-fn restart_if_requested(paths: &AppPaths, response: &Value) -> Result<()> {
+fn restart_if_requested(
+    paths: &AppPaths,
+    response: &Value,
+    desktop: &DesktopSession,
+) -> Result<()> {
     if response["restart_required"] != true {
         return Ok(());
     }
     for _ in 0..80 {
         if !service::daemon_running(paths) {
-            util::spawn_detached(&util::exe_path(), &["--cli", "run"])?;
+            desktop.spawn(&["--cli", "run"])?;
             wait_for_api(paths)?;
             return Ok(());
         }
@@ -438,7 +486,28 @@ fn show_status(window: &MainWindow, snapshot: Result<Value>) {
         }
         .into(),
     );
-    let whitelist = protection["whitelist"].as_array().map_or(0, Vec::len);
+    let rules: Vec<String> = protection["whitelist"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    let whitelist = rules.len();
+    let displayed = window.get_whitelist_entries();
+    if displayed.row_count() != whitelist
+        || displayed
+            .iter()
+            .zip(&rules)
+            .any(|(shown, rule)| shown.as_str() != rule)
+    {
+        window.set_whitelist_entries(slint::ModelRc::new(slint::VecModel::from(
+            rules
+                .iter()
+                .map(|s| slint::SharedString::from(s.as_str()))
+                .collect::<Vec<_>>(),
+        )));
+    }
     let detail = if healthy && !matches {
         "严格保护已开启。要让 Codex 使用这个出口，请在下方确认接管配置。".to_string()
     } else if enabled || problem {
@@ -450,7 +519,11 @@ fn show_status(window: &MainWindow, snapshot: Result<Value>) {
     };
     window.set_detail_text(detail.into());
     let local = value["local_proxy"].as_str();
-    if whitelist != 0 || local != Some(window.get_trust_candidate_proxy().as_str()) {
+    let already_trusted = window
+        .get_trust_candidate_ip()
+        .parse()
+        .is_ok_and(|ip| crate::config::ip_allowed(ip, &rules));
+    if already_trusted || local != Some(window.get_trust_candidate_proxy().as_str()) {
         window.set_trust_candidate_ip("".into());
     }
     let route = if let Some(proxy) = local {
@@ -556,6 +629,9 @@ fn request(paths: &AppPaths, endpoint: &str, body: Option<Value>) -> Result<Valu
             .await
             .context("无法连接 GPTGuard 后台")?;
         let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND && endpoint == "/api/whitelist/remove" {
+            bail!("当前后台版本较旧。请从通知区退出旧版 GPTGuard，再启动新版后删除规则。");
+        }
         let value: Value = response.json().await.context("读取后台响应失败")?;
         if !status.is_success() {
             return Err(ApiFailure {

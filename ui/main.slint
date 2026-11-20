@@ -37,12 +37,15 @@ export component MainWindow inherits Window {
     in property <bool> setup_needed;
     in property <string> takeover_label: "确认接管配置";
     in property <string> doctor_text;
+    in property <[string]> whitelist_entries;
+    in-out property <string> whitelist_input;
     in property <string> about_text;
     in property <string> trust_candidate_ip;
     in property <string> trust_candidate_proxy;
     in property <bool> activate_after_trust;
     private property <bool> show_more: false;
-    private property <bool> show_doctor: false;
+    private property <bool> show_doctor: true;
+    private property <bool> show_whitelist: false;
     private property <bool> show_about: false;
     private property <bool> ready: root.state_known && !root.operation_busy;
     private property <bool> confirming_activation: root.trust_candidate_ip != "" && root.activate_after_trust && !root.protection_enabled;
@@ -55,6 +58,7 @@ export component MainWindow inherits Window {
     callback import_clicked(string);
     callback file_clicked();
     callback add_exit_clicked(string);
+    callback remove_exit_clicked(string);
     callback takeover_clicked();
     callback restore_clicked();
     callback protection_clicked(bool);
@@ -120,7 +124,7 @@ export component MainWindow inherits Window {
                     padding: 16px;
                     spacing: 6px;
                     Heading { text: "后台诊断"; }
-                    BodyText { text: root.doctor_text == "" ? "等候后台返回诊断结果" : root.doctor_text; }
+                    BodyText { text: root.doctor_text == "" ? "正在读取权限、出口白名单和 Codex 状态…" : root.doctor_text; }
                 }
             }
             Card {
@@ -133,7 +137,33 @@ export component MainWindow inherits Window {
                         alignment: start;
                         spacing: 8px;
                         Button { text: "连接 Clash Verge"; enabled: root.ready; clicked => { root.connect_local_clicked(); } }
+                        Button { text: root.show_whitelist ? "收起白名单" : "管理白名单"; clicked => { root.show_whitelist = !root.show_whitelist; } }
                         Button { text: root.show_more ? "收起其他方式" : "其他连接方式"; clicked => { root.show_more = !root.show_more; } }
+                    }
+                    if root.show_whitelist: VerticalLayout {
+                        spacing: 6px;
+                        Heading { text: "出口白名单"; font-size: 15px; }
+                        BodyText { text: "换节点后可点击“检测出口”添加新 IP，也可以手动输入 IP 或 CIDR 网段。"; }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            entry := LineEdit {
+                                text <=> root.whitelist_input;
+                                placeholder-text: "出口 IP 或 CIDR 网段";
+                                accessible-label: "出口 IP 或 CIDR 网段";
+                                enabled: root.ready;
+                                accepted => { if self.text != "" { root.add_exit_clicked(self.text); } }
+                            }
+                            Button { text: "添加规则"; enabled: root.ready && entry.text != ""; clicked => { root.add_exit_clicked(entry.text); } }
+                        }
+                        if root.whitelist_entries.length == 0: BodyText { text: root.state_known ? "尚未保存出口规则" : "正在读取规则…"; }
+                        for rule in root.whitelist_entries: HorizontalLayout {
+                            spacing: 8px;
+                            BodyText { text: rule; horizontal-stretch: 1; vertical-alignment: center; }
+                            Button { text: "删除"; accessible-label: "删除规则 " + rule; enabled: root.ready; clicked => { root.remove_exit_clicked(rule); } }
+                        }
+                        if root.protection_enabled && root.whitelist_entries.length == 1: BodyText {
+                            text: "删除最后一条规则后，严格保护会阻断转发，直到新出口通过检测。";
+                        }
                     }
                     if root.show_more: VerticalLayout {
                         spacing: 6px;
@@ -142,11 +172,6 @@ export component MainWindow inherits Window {
                             subscription := LineEdit { placeholder-text: "订阅地址"; enabled: root.ready; }
                             Button { text: "导入订阅"; enabled: root.ready && subscription.text != ""; clicked => { root.import_clicked(subscription.text); } }
                             Button { text: "选择文件"; enabled: root.ready; clicked => { root.file_clicked(); } }
-                        }
-                        HorizontalLayout {
-                            spacing: 6px;
-                            entry := LineEdit { placeholder-text: "已知的出口 IP 或 CIDR 网段"; enabled: root.ready; }
-                            Button { text: "加入白名单"; enabled: root.ready && entry.text != ""; clicked => { root.add_exit_clicked(entry.text); } }
                         }
                     }
                 }

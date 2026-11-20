@@ -232,6 +232,10 @@ pub fn open_url(url: &str) -> Result<()> {
 pub fn spawn_detached(program: &Path, args: &[&str]) -> Result<()> {
     let mut command = Command::new(program);
     command.args(args);
+    spawn_background(&mut command)
+}
+
+pub(crate) fn spawn_background(command: &mut Command) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -242,7 +246,7 @@ pub fn spawn_detached(program: &Path, args: &[&str]) -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .with_context(|| format!("spawn {}", program.display()))?;
+        .with_context(|| format!("spawn {}", Path::new(command.get_program()).display()))?;
     Ok(())
 }
 

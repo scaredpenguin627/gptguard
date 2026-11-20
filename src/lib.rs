@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod codex;
 pub mod config;
+mod desktop;
 pub mod guard;
 pub mod ipcheck;
 pub mod mihomo;
