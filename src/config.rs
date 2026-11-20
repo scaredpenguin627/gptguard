@@ -717,27 +717,14 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&tmp, bytes)?;
-    // Windows rename does not replace an existing file.
-    if path.exists() {
-        let backup = path.with_extension("bak-tmp");
-        let _ = fs::remove_file(&backup);
-        fs::rename(path, &backup)?;
-        match fs::rename(&tmp, path) {
-            Ok(()) => {
-                let _ = fs::remove_file(&backup);
-                Ok(())
-            }
-            Err(err) => {
-                let _ = fs::rename(&backup, path);
-                Err(err.into())
-            }
-        }
-    } else {
-        fs::rename(&tmp, path)?;
-        Ok(())
+    // A status reader must never see the file disappear and create a new
+    // default configuration while a whitelist edit is being committed.
+    let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    let result = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
+    result.with_context(|| format!("replace {}", path.display()))
 }
 
 pub fn detect_targets() -> Vec<TargetConfig> {

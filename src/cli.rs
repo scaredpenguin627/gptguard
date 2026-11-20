@@ -182,7 +182,7 @@ pub fn run() -> Result<()> {
             block_on(service::run(config, paths, open_panel))
         }
         Command::Stop => stop(&paths),
-        Command::Tray { start_guard } => crate::tray::run(start_guard),
+        Command::Tray { start_guard } => crate::tray::run_with_paths(paths, start_guard),
         Command::Status => status(&paths),
         Command::Check => block_on(check(&paths)),
         Command::Doctor => doctor(&paths),

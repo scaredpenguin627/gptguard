@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::codex::config_tx;
 use crate::codex::provider;
 use crate::codex::routes;
-use crate::config::{discover_local_proxy, parse_net, Config, RouteConfig};
+use crate::config::{discover_local_proxy, ip_allowed, parse_net, Config, RouteConfig};
 use crate::service::AppState;
 use crate::util;
 
@@ -42,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/check", post(api_check))
         .route("/api/protection", post(api_protection))
         .route("/api/whitelist", post(api_whitelist))
+        .route("/api/whitelist/remove", post(api_remove_whitelist_entry))
         .route("/api/doctor", get(api_status))
         .route("/api/logs", get(api_logs))
         .route("/api/codex/model", post(api_model))
@@ -205,12 +206,10 @@ async fn api_check(State(state): State<AppState>, headers: HeaderMap) -> Respons
     let before = state.config();
     let runtime = state.check_now().await;
     let current = state.config();
-    let candidate = if before.same_egress_policy(&current)
-        && runtime.detected
-        && current.protection.whitelist.is_empty()
-    {
+    let candidate = if before.same_egress_policy(&current) && runtime.detected {
         local_exit_proxy(&current)
             .zip(runtime.http_ip.as_deref().and_then(valid_exit_ip))
+            .filter(|(_, ip)| !ip_allowed(*ip, &current.protection.whitelist))
             .map(|(proxy, ip)| serde_json::json!({"proxy": proxy, "ip": ip}))
     } else {
         None
@@ -229,9 +228,9 @@ struct ProtectionBody {
 
 #[derive(Debug, thiserror::Error)]
 enum ActivationError {
-    #[error("请先连接 Clash Verge 并确认出口 IP，或在“其他连接方式”中填写已知的出口白名单。")]
+    #[error("请先连接 Clash Verge 并确认出口 IP，或在“管理白名单”中添加已知的可信出口。")]
     Whitelist,
-    #[error("GPTGuard 后台以普通权限运行。请关闭主窗口，从通知区退出 GPTGuard，再右键选择“以管理员身份运行”。")]
+    #[error("GPTGuard 后台以普通权限运行。请从通知区退出 GPTGuard，再右键选择“以管理员身份运行”。")]
     Elevation,
 }
 
@@ -322,6 +321,42 @@ async fn api_whitelist(
         );
     }
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+}
+
+#[derive(Deserialize)]
+struct WhitelistEntry {
+    entry: String,
+}
+
+async fn api_remove_whitelist_entry(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WhitelistEntry>,
+) -> Response {
+    if let Err(response) = authorized(&state, &headers) {
+        return response;
+    }
+    let entry = body.entry.trim();
+    if parse_net(entry).is_err() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_whitelist",
+            "请选择有效的 IP 或 CIDR 规则。",
+        );
+    }
+    // Edit only the selected rule under the config lock. A different client
+    // may have added another exit since the window displayed its list.
+    if let Err(err) = state.update_config(|cfg| {
+        cfg.protection.whitelist.retain(|rule| rule.trim() != entry);
+        Ok(())
+    }) {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "save_failed",
+            &format!("{err:#}"),
+        );
+    }
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 async fn api_logs(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -853,13 +888,6 @@ async fn api_trust_local_exit(
         );
     };
     let cfg = state.config();
-    if !cfg.protection.whitelist.is_empty() {
-        return api_error(
-            StatusCode::CONFLICT,
-            "whitelist_already_configured",
-            "出口白名单已经配置",
-        );
-    }
     let Some(proxy) = local_exit_proxy(&cfg) else {
         return api_error(
             StatusCode::CONFLICT,
@@ -891,7 +919,9 @@ async fn api_trust_local_exit(
             current.same_egress_policy(&cfg),
             "检测期间出口配置已变化，请重新检测并确认。"
         );
-        current.protection.whitelist.push(ip.to_string());
+        if !ip_allowed(ip, &current.protection.whitelist) {
+            current.protection.whitelist.push(ip.to_string());
+        }
         Ok(())
     }) {
         return api_error(StatusCode::CONFLICT, "trust_failed", &format!("{err:#}"));
@@ -992,6 +1022,7 @@ pub fn routes_map() -> HashMap<&'static str, &'static str> {
         ("POST", "/api/check"),
         ("POST", "/api/protection"),
         ("POST", "/api/whitelist"),
+        ("POST", "/api/whitelist/remove"),
         ("POST", "/api/codex/takeover"),
         ("POST", "/api/codex/restore"),
         ("POST", "/api/codex/probe"),

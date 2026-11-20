@@ -416,7 +416,7 @@ pub fn doctor(config: &Config) -> Vec<(String, bool, String)> {
         if util::is_elevated() {
             "后台可管理 hosts 和防火墙"
         } else {
-            "关闭主窗口，从通知区退出 GPTGuard，再右键选择“以管理员身份运行”"
+            "从通知区退出 GPTGuard，再右键选择“以管理员身份运行”"
         }
         .into(),
     ));

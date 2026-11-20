@@ -160,6 +160,7 @@ impl AppState {
 }
 
 pub async fn run(config: Config, paths: AppPaths, open_panel: bool) -> Result<()> {
+    let desktop = crate::desktop::DesktopSession::join(&paths)?;
     paths.ensure()?;
     util::init_logging(&paths.log_dir)?;
     let _lock = acquire_instance_lock(&paths)?;
@@ -255,6 +256,9 @@ pub async fn run(config: Config, paths: AppPaths, open_panel: bool) -> Result<()
         }
         _ = shutdown.notified() => {
             util::info("shutdown requested by the native configuration flow");
+        }
+        _ = desktop.wait_for_exit() => {
+            util::info("shutting down at the tray's request");
         }
     }
     util::info("shutting down");

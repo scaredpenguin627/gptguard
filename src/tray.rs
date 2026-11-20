@@ -15,6 +15,7 @@ mod imp {
     use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 
     use crate::config::{AppPaths, Config};
+    use crate::desktop::DesktopSession;
     use crate::service;
     use crate::util;
 
@@ -31,6 +32,7 @@ mod imp {
 
     pub struct TrayApp {
         paths: AppPaths,
+        desktop: DesktopSession,
         token: String,
         port: u16,
         tray: Option<TrayState>,
@@ -38,9 +40,10 @@ mod imp {
     }
 
     impl TrayApp {
-        pub fn new(paths: AppPaths, config: &Config) -> Self {
+        fn new(paths: AppPaths, config: &Config, desktop: DesktopSession) -> Self {
             Self {
                 paths,
+                desktop,
                 token: config.ui.admin_token.clone(),
                 port: config.ui.web_port,
                 tray: None,
@@ -139,7 +142,7 @@ mod imp {
                 if event.id == check_id {
                     self.post("/api/check", serde_json::json!({}));
                 } else if event.id == open_id {
-                    let _ = util::spawn_detached(&util::exe_path(), &[]);
+                    let _ = self.desktop.spawn(&[]);
                 } else if event.id == protection_id {
                     self.toggle("/api/protection", "protection");
                 } else if event.id == update_id {
@@ -147,8 +150,16 @@ mod imp {
                 } else if event.id == autostart_id {
                     self.toggle("/api/autostart", "ui");
                 } else if event.id == exit_id {
-                    self.post_blocking("/api/shutdown", serde_json::json!({}));
-                    event_loop.exit();
+                    if let Err(err) = self.quit_desktop() {
+                        util::error(format!("tray exit: {err:#}"));
+                        rfd::MessageDialog::new()
+                            .set_title("GPTGuard 退出失败")
+                            .set_description(format!("无法通知主窗口退出。{err:#}"))
+                            .show();
+                    } else {
+                        event_loop.exit();
+                    }
+                    return;
                 }
             }
         }
@@ -156,7 +167,7 @@ mod imp {
         fn handle_tray_click(&mut self) {
             while let Ok(event) = TrayIconEvent::receiver().try_recv() {
                 if matches!(event, TrayIconEvent::DoubleClick { .. }) {
-                    let _ = util::spawn_detached(&util::exe_path(), &[]);
+                    let _ = self.desktop.spawn(&[]);
                 }
             }
         }
@@ -191,7 +202,16 @@ mod imp {
             });
         }
 
-        fn post_blocking(&self, path: &str, body: serde_json::Value) {
+        fn quit_desktop(&self) -> Result<()> {
+            // Older workers only know the authenticated shutdown endpoint.
+            // Send it before the broadcast, so a fresh launch cannot receive
+            // a delayed HTTP shutdown intended for the previous session.
+            self.stop_worker();
+            self.desktop.request_exit()
+        }
+
+        fn stop_worker(&self) {
+            let path = "/api/shutdown";
             let url = format!("http://127.0.0.1:{}{}", self.port, path);
             let token = self.token.clone();
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -203,12 +223,12 @@ mod imp {
             let _ = runtime.block_on(async move {
                 let client = reqwest::Client::builder()
                     .no_proxy()
-                    .timeout(Duration::from_secs(5))
+                    .timeout(Duration::from_secs(1))
                     .build()?;
                 client
                     .post(url)
                     .header("x-gptguard-token", token)
-                    .json(&body)
+                    .json(&serde_json::json!({}))
                     .send()
                     .await
             });
@@ -285,6 +305,10 @@ mod imp {
 
         fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
             self.handle_menu(event_loop);
+            if event_loop.exiting() || self.desktop.exit_requested() {
+                event_loop.exit();
+                return;
+            }
             self.handle_tray_click();
             if self.last_refresh.elapsed() > Duration::from_secs(2) {
                 self.last_refresh = Instant::now();
@@ -343,15 +367,19 @@ mod imp {
     }
 
     pub fn run(start_guard: bool) -> Result<()> {
-        run_impl(start_guard, false)
+        run_with_paths(AppPaths::discover(), start_guard)
+    }
+
+    pub fn run_with_paths(paths: AppPaths, start_guard: bool) -> Result<()> {
+        run_impl(paths, start_guard, false)
     }
 
     pub fn run_gui() -> Result<()> {
-        run_impl(true, true)
+        run_impl(AppPaths::discover(), true, true)
     }
 
-    fn run_impl(start_guard: bool, open_panel: bool) -> Result<()> {
-        let paths = AppPaths::discover();
+    fn run_impl(paths: AppPaths, start_guard: bool, open_panel: bool) -> Result<()> {
+        let desktop = DesktopSession::join(&paths)?;
         paths.ensure()?;
         util::init_logging(&paths.log_dir)?;
         let lock = std::fs::OpenOptions::new()
@@ -364,7 +392,7 @@ mod imp {
         }
         let _lock = lock;
         let config = Config::load_or_create(&paths)?;
-        ensure_daemon(&paths, start_guard)?;
+        ensure_daemon(&paths, start_guard, &desktop)?;
         if open_panel {
             let url = format!(
                 "http://127.0.0.1:{}/#token={}",
@@ -377,19 +405,19 @@ mod imp {
             .build()
             .context("create winit event loop")?;
         event_loop.set_control_flow(ControlFlow::Wait);
-        let mut app = TrayApp::new(paths, &config);
+        let mut app = TrayApp::new(paths, &config, desktop);
         event_loop
             .run_app(&mut app)
             .context("run tray event loop")?;
         Ok(())
     }
 
-    fn ensure_daemon(paths: &AppPaths, _start_guard: bool) -> Result<()> {
+    fn ensure_daemon(paths: &AppPaths, _start_guard: bool, desktop: &DesktopSession) -> Result<()> {
         if daemon_alive(paths) {
             return Ok(());
         }
         util::info("starting daemon from tray");
-        util::spawn_detached(&cli_path(), &["run"])?;
+        desktop.spawn(&["--cli", "run"])?;
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(150));
             if daemon_alive(paths) {
@@ -399,23 +427,76 @@ mod imp {
         anyhow::bail!("守护启动超时；请从命令行运行 gptguard run 查看错误")
     }
 
-    fn cli_path() -> std::path::PathBuf {
-        // v0.4.0 has one executable.  Never prefer an old side-by-side
-        // gptguard-cli.exe, which could reintroduce the legacy provider flow.
-        util::exe_path()
-    }
-
     fn daemon_alive(paths: &AppPaths) -> bool {
         service::daemon_running(paths)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn tray_quit_stops_the_worker_and_reaches_the_window_even_when_offline() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path();
+            let paths = AppPaths {
+                config_dir: dir.into(),
+                data_dir: dir.into(),
+                config_file: dir.join("config.json"),
+                state_file: dir.join("state.json"),
+                log_dir: dir.join("logs"),
+                backups_dir: dir.join("backups"),
+                lock_file: dir.join("guard.lock"),
+            };
+            let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let relay = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut cfg = Config::load_or_create(&paths).unwrap();
+            cfg.ui.web_port = api.local_addr().unwrap().port();
+            cfg.codex.listen = relay.local_addr().unwrap().to_string();
+            cfg.codex.codex_home = Some(dir.join("codex").display().to_string());
+            cfg.protection.network_guard = false;
+            cfg.protection.kill_on_block = false;
+            cfg.protection.targets.clear();
+            cfg.save(&paths).unwrap();
+            drop((api, relay));
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let worker = rt.spawn(service::run(cfg.clone(), paths.clone(), false));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while std::net::TcpStream::connect(("127.0.0.1", cfg.ui.web_port)).is_err() {
+                assert!(
+                    Instant::now() < deadline,
+                    "worker did not open management port"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            for _ in 0..2 {
+                let window = DesktopSession::join(&paths).unwrap();
+                assert!(!window.exit_requested());
+                let app = TrayApp::new(paths.clone(), &cfg, DesktopSession::join(&paths).unwrap());
+                app.quit_desktop().unwrap();
+                assert!(window.exit_requested());
+                let until = Instant::now() + Duration::from_secs(8);
+                while daemon_alive(&paths) {
+                    assert!(Instant::now() < until, "worker still running after quit");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            rt.block_on(worker).unwrap().unwrap();
+        }
     }
 }
 
 #[cfg(windows)]
-pub use imp::{run, run_gui};
+pub use imp::{run, run_gui, run_with_paths};
 
 #[cfg(not(windows))]
 pub fn run(_start_guard: bool) -> anyhow::Result<()> {
     anyhow::bail!("托盘目前只支持 Windows；其他平台请使用 gptguard run 和网页面板")
+}
+
+#[cfg(not(windows))]
+pub fn run_with_paths(_paths: crate::config::AppPaths, start_guard: bool) -> anyhow::Result<()> {
+    run(start_guard)
 }
 
 #[cfg(not(windows))]

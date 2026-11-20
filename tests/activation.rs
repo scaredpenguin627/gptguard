@@ -31,6 +31,29 @@ fn reading_a_legacy_empty_whitelist_keeps_existing_protection() {
     assert_eq!(original, std::fs::read(&paths.config_file).unwrap());
 }
 
+#[test]
+fn readers_always_see_a_complete_file_during_concurrent_rule_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rules.json");
+    let first = br#"["203.0.113.7"]"#;
+    let second = br#"["2001:db8::/64"]"#;
+    gptguard::config::atomic_write(&path, first).unwrap();
+    std::thread::scope(|scope| {
+        for bytes in [first.as_slice(), second.as_slice()] {
+            let path = &path;
+            scope.spawn(move || {
+                for _ in 0..24 {
+                    gptguard::config::atomic_write(path, bytes).unwrap();
+                }
+            });
+        }
+        for _ in 0..100 {
+            let rules = std::fs::read(&path).unwrap();
+            assert!(rules == first || rules == second);
+        }
+    });
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn activation_rejects_empty_rules_and_blocks_unverified_clash_requests() {
     let tmp = tempfile::tempdir().unwrap();
@@ -156,6 +179,47 @@ async fn activation_rejects_empty_rules_and_blocks_unverified_clash_requests() {
         denied.json::<Value>().await.unwrap()["error"]["code"],
         "egress_unverified"
     );
+    let unauthorized = client
+        .post(format!("{base}/whitelist/remove"))
+        .json(&json!({"entry":"203.0.113.7"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        post("whitelist/remove", json!({"entry":"invalid"}))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let add = post(
+        "whitelist",
+        json!({"entries":["2001:db8::/64"],"append":true}),
+    );
+    let remove = post("whitelist/remove", json!({"entry":"203.0.113.7"}));
+    let (added, removed) = tokio::join!(add, remove);
+    assert!(added.unwrap().status().is_success() && removed.unwrap().status().is_success());
+    let changed = Config::load_or_create(&paths).unwrap();
+    assert_eq!(changed.protection.whitelist, ["2001:db8::/64"]);
+    for _ in 0..2 {
+        assert!(post("whitelist/remove", json!({"entry":"2001:db8::/64"}))
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+    }
+    let empty = Config::load_or_create(&paths).unwrap();
+    assert!(empty.protection.enabled && empty.protection.whitelist.is_empty());
+    let blocked = client
+        .get(format!(
+            "http://{}/backend-api/codex/models",
+            cfg.codex.listen
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         post("protection", json!({"enabled":false}))
             .await

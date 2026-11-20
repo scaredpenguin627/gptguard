@@ -44,7 +44,7 @@ jobs:
       - name: Smoke install and uninstall
         shell: pwsh
         run: |
-          $installer = (Get-ChildItem dist -File -Filter 'GPTGuard-Setup-v0.4.5-windows-x64.exe').FullName
+          $installer = (Get-ChildItem dist -File -Filter 'GPTGuard-Setup-v0.4.6-windows-x64.exe').FullName
           $installDir = Join-Path $env:RUNNER_TEMP 'GPTGuardSmoke'
           $installLog = Join-Path $env:RUNNER_TEMP 'GPTGuardSmoke-install.log'
           if (Test-Path $installDir) { Remove-Item -Recurse -Force $installDir }
@@ -69,5 +69,5 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/GPTGuard-Setup-v0.4.5-windows-x64.exe
+          files: dist/GPTGuard-Setup-v0.4.6-windows-x64.exe
           fail_on_unmatched_files: true
